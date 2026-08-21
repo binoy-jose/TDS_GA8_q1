@@ -992,19 +992,18 @@ def sort_rejected_objects(items):
 
         uri = item["uri"]
 
-        if uri is None:
-
-            primary = b""
-
-        else:
-
-            primary = uri.encode("utf-8")
-
+        if isinstance(uri, str):
+            return (
+                0,
+                uri.encode("utf-8"),
+                compact_json(item).encode("utf-8"),
+            )
         return (
-            primary,
-            compact_json(item).encode("utf-8")
-        )
-
+            1,
+            b"",
+            compact_json(item).encode("utf-8"),
+           )
+            
     return sorted(items, key=key)
 
 
