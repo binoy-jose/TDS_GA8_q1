@@ -51,7 +51,7 @@ TIME_RE = re.compile(
 
 # Basic Google Storage URI:
 # gs://bucket/object
-URI_RE = re.compile(r"^gs://[^/]+/.+$")
+URI_RE = re.compile(r"^gs://[^/\s]+/[^\s]+$")
 
 
 # A generation must contain only decimal digits.
@@ -70,6 +70,24 @@ SAFE_INTEGER_MAX = 2**53 - 1
 # SMALL HELPER FUNCTIONS
 # ---------------------------------------------------------
 
+def strict_json_loads(value):
+    """
+    Parse strict JSON.
+
+    Python normally accepts NaN, Infinity and -Infinity,
+    although they are not valid JSON.
+    We reject them.
+    """
+
+    def reject_invalid_constant(constant):
+        raise ValueError(
+            f"Invalid JSON constant: {constant}"
+        )
+
+    return json.loads(
+        value,
+        parse_constant=reject_invalid_constant
+    )
 def utf8_key(value):
     """
     Convert a string to UTF-8 bytes.
@@ -473,11 +491,20 @@ def validate_and_read_object(obj):
     # GENERATION validation
     # -----------------------------------------------------
 
+    generation_supplied = (
+        isinstance(obj, dict)
+        and "generation" in obj
+    )
+
+    fetched_generation_supplied = (
+        isinstance(obj, dict)
+        and "fetchedGeneration" in obj
+    )
+    # generation must be a decimal string.
     generation_valid = (
         isinstance(generation, str)
         and DECIMAL_RE.fullmatch(generation) is not None
     )
-
     fetched_generation_valid = (
         isinstance(fetched_generation, str)
         and DECIMAL_RE.fullmatch(fetched_generation) is not None
@@ -488,8 +515,13 @@ def validate_and_read_object(obj):
 
         reason_codes.append("GENERATION_INVALID")
 
-    # Unequal supplied values -> GENERATION_MISMATCH.
-    if generation != fetched_generation:
+    # GENERATION_MISMATCH applies when both fields were supplied
+    # but their values are different.
+    if (
+        generation_supplied
+        and fetched_generation_supplied
+        and generation != fetched_generation
+    ):
 
         reason_codes.append("GENERATION_MISMATCH")
 
@@ -555,10 +587,9 @@ def validate_and_read_object(obj):
             # Try to parse this JSON line.
             try:
 
-                row = json.loads(line)
+                row = strict_json_loads(line)
 
-            except json.JSONDecodeError:
-
+            except (json.JSONDecodeError, ValueError):
                 # Parsing failure.
                 reason_codes.append("JSONL_INVALID")
 
@@ -985,9 +1016,20 @@ async def build_corpus(request: Request):
 
     try:
 
-        body = await request.json()
+        # Read the exact incoming HTTP body.
+        raw_body = await request.body()
 
-    except Exception:
+        # JSON must be valid UTF-8.
+        body_text = raw_body.decode("utf-8")
+
+        # Parse using strict JSON rules.
+        body = strict_json_loads(body_text)
+
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ):
 
         # Invalid JSON request.
         return JSONResponse(
