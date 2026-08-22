@@ -1536,3 +1536,2237 @@ async def build_corpus(request: Request):
 
 
     return response_payload
+
+# =========================================================
+# WEEK 8 - Q2
+# Leakage-Safe BigQuery ML Experiment Gate
+# Endpoint: POST /bqml
+# =========================================================
+
+
+# ---------------------------------------------------------
+# STATEFUL RUN STORE
+# ---------------------------------------------------------
+
+# This dictionary remembers each selection by runId.
+#
+# Example:
+#
+# RUN_STORE["experiment-1"] = {
+#     "fingerprint": "...",
+#     "response": {...}
+# }
+#
+# Render is currently using one worker, so the hidden grader's
+# select -> evaluate requests can share this state.
+BQML_RUN_STORE = {}
+
+
+# A frozen datasetDigest must be exactly:
+# 64 lowercase hexadecimal characters.
+BQML_DIGEST_RE = re.compile(
+    r"^[0-9a-f]{64}$"
+)
+
+
+# ---------------------------------------------------------
+# BQML HELPER FUNCTIONS
+# ---------------------------------------------------------
+
+def bqml_utf8_ok(value):
+    """
+    Check that a value is a Python string that can be
+    encoded as valid UTF-8.
+
+    We need this because IDs and feature names are sorted
+    using UTF-8 bytes.
+    """
+
+    if not isinstance(value, str):
+        return False
+
+    try:
+        value.encode("utf-8")
+        return True
+
+    except UnicodeEncodeError:
+        return False
+
+
+def bqml_is_safe_int(value):
+    """
+    A non-negative JavaScript-safe integer.
+
+    Maximum:
+    2^53 - 1
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= SAFE_INTEGER_MAX
+    )
+
+
+def bqml_is_number(value):
+    """
+    True for an int or float, but NOT True/False.
+
+    Python considers bool a subclass of int,
+    so we explicitly reject booleans.
+    """
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    )
+
+
+def bqml_is_finite_unit(value):
+    """
+    Validate a finite number in [0, 1].
+
+    Used for:
+    - metricFloor
+    - required slice floors
+    """
+
+    return (
+        bqml_is_number(value)
+        and math.isfinite(float(value))
+        and 0.0 <= float(value) <= 1.0
+    )
+
+
+def bqml_sort_codes(codes):
+    """
+    Sort and deduplicate reason codes by UTF-8 bytes.
+    """
+
+    return sorted(
+        set(codes),
+        key=lambda code: code.encode("utf-8")
+    )
+
+
+# ---------------------------------------------------------
+# SELECTION REQUEST FINGERPRINT
+# ---------------------------------------------------------
+
+def bqml_selection_fingerprint(body):
+    """
+    Create an internal fingerprint of the selection request.
+
+    This is NOT the datasetDigest.
+
+    It is only used to detect:
+
+        same runId + same input
+            -> replay stored response
+
+        same runId + different input
+            -> HTTP 409 RUN_ID_CONFLICT
+
+    sort_keys=True means JSON object key order does not
+    accidentally create a conflict.
+    """
+
+    canonical = json.dumps(
+        body,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":")
+    )
+
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+
+
+# ---------------------------------------------------------
+# DATASET DIGEST
+# ---------------------------------------------------------
+
+def bqml_make_dataset_digest(
+    train_row_ids,
+    eval_row_ids,
+    feature_names
+):
+    """
+    Required exact digest artifact:
+
+    {
+      "trainRowIds": [...],
+      "evalRowIds": [...],
+      "featureNames": [...]
+    }
+
+    Key order must stay exactly as above.
+
+    JSON is compact and encoded as UTF-8.
+    """
+
+    digest_object = {
+        "trainRowIds": train_row_ids,
+        "evalRowIds": eval_row_ids,
+        "featureNames": feature_names,
+    }
+
+
+    # Compact JSON.
+    exact_json = json.dumps(
+        digest_object,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+
+    # SHA-256 of exact UTF-8 bytes.
+    return hashlib.sha256(
+        exact_json.encode("utf-8")
+    ).hexdigest()
+
+
+# =========================================================
+# SELECT PHASE
+# =========================================================
+
+def bqml_process_select(body, request_id):
+
+    reason_codes = []
+
+
+    # -----------------------------------------------------
+    # 1. Validate runId
+    # -----------------------------------------------------
+
+    run_id = body.get("runId")
+
+
+    run_id_valid = (
+        bqml_utf8_ok(run_id)
+        and 1 <= len(run_id) <= 128
+    )
+
+
+    if not run_id_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # 2. Validate forbiddenFeatures
+    # -----------------------------------------------------
+
+    forbidden_features = body.get(
+        "forbiddenFeatures"
+    )
+
+
+    forbidden_valid = (
+        isinstance(forbidden_features, list)
+        and all(
+            bqml_utf8_ok(name)
+            for name in forbidden_features
+        )
+    )
+
+
+    if not forbidden_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+        forbidden_set = set()
+
+    else:
+
+        # Using a set makes membership checks easy.
+        forbidden_set = set(
+            forbidden_features
+        )
+
+
+    # -----------------------------------------------------
+    # 3. Validate numTrialsLimit
+    # -----------------------------------------------------
+
+    num_trials_limit = body.get(
+        "numTrialsLimit"
+    )
+
+
+    num_trials_limit_valid = (
+        isinstance(num_trials_limit, int)
+        and not isinstance(
+            num_trials_limit,
+            bool
+        )
+        and num_trials_limit > 0
+    )
+
+
+    if not num_trials_limit_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # 4. Validate selection rows
+    # -----------------------------------------------------
+
+    rows = body.get("rows")
+
+
+    # Selection rows must be a NON-EMPTY array.
+    rows_container_valid = (
+        isinstance(rows, list)
+        and len(rows) > 0
+    )
+
+
+    if not rows_container_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    parsed_rows = []
+
+    seen_row_ids = set()
+
+    rows_structurally_valid = (
+        rows_container_valid
+    )
+
+
+    if rows_container_valid:
+
+        for row_index, row in enumerate(rows):
+
+            # Start by assuming this row is valid.
+            row_ok = isinstance(
+                row,
+                dict
+            )
+
+
+            if not row_ok:
+
+                rows_structurally_valid = False
+
+                continue
+
+
+            # ---------------------------------------------
+            # Extract fields
+            # ---------------------------------------------
+
+            row_id = row.get("id")
+
+            entity = row.get("entity")
+
+            event_time_raw = row.get(
+                "eventTime"
+            )
+
+            prediction_time_raw = row.get(
+                "predictionTime"
+            )
+
+            version = row.get("version")
+
+            split = row.get("split")
+
+            features = row.get("features")
+
+
+            # ---------------------------------------------
+            # Row ID
+            #
+            # Must be a UTF-8 string.
+            # IDs must also be unique within rows[].
+            # ---------------------------------------------
+
+            if not bqml_utf8_ok(row_id):
+
+                row_ok = False
+
+            else:
+
+                if row_id in seen_row_ids:
+
+                    row_ok = False
+
+                else:
+
+                    seen_row_ids.add(
+                        row_id
+                    )
+
+
+            # ---------------------------------------------
+            # Entity
+            # ---------------------------------------------
+
+            if not bqml_utf8_ok(entity):
+
+                row_ok = False
+
+
+            # ---------------------------------------------
+            # eventTime + predictionTime
+            #
+            # Reuse our strict timestamp parser from Q1.
+            #
+            # It converts to:
+            #
+            # YYYY-MM-DDTHH:mm:ss.sssZ
+            # ---------------------------------------------
+
+            event_time_utc = parse_event_time(
+                event_time_raw
+            )
+
+
+            prediction_time_utc = (
+                parse_event_time(
+                    prediction_time_raw
+                )
+            )
+
+
+            if (
+                event_time_utc is None
+                or prediction_time_utc is None
+            ):
+
+                row_ok = False
+
+
+            # ---------------------------------------------
+            # Version
+            # ---------------------------------------------
+
+            if not bqml_is_safe_int(
+                version
+            ):
+
+                row_ok = False
+
+
+            # ---------------------------------------------
+            # Split
+            #
+            # This is one of the most important
+            # leakage protections.
+            #
+            # Selection NEVER accepts TEST rows.
+            # ---------------------------------------------
+
+            if split not in (
+                "TRAIN",
+                "EVAL"
+            ):
+
+                row_ok = False
+
+
+            # ---------------------------------------------
+            # Features
+            # ---------------------------------------------
+
+            parsed_features = {}
+
+
+            if not isinstance(
+                features,
+                dict
+            ):
+
+                row_ok = False
+
+
+            else:
+
+                for (
+                    feature_name,
+                    feature_info
+                ) in features.items():
+
+
+                    # Feature name needs valid UTF-8
+                    # because we later sort by UTF-8 bytes.
+                    if not bqml_utf8_ok(
+                        feature_name
+                    ):
+
+                        row_ok = False
+
+                        continue
+
+
+                    # Every feature record must contain:
+                    #
+                    # value
+                    # availableAt
+                    #
+                    # We intentionally NEVER interpret value.
+                    # Instructions inside value are just data.
+                    if (
+                        not isinstance(
+                            feature_info,
+                            dict
+                        )
+                        or "value"
+                        not in feature_info
+                        or "availableAt"
+                        not in feature_info
+                    ):
+
+                        row_ok = False
+
+                        continue
+
+
+                    # availableAt must itself be
+                    # a valid timestamp.
+                    available_at_utc = (
+                        parse_event_time(
+                            feature_info.get(
+                                "availableAt"
+                            )
+                        )
+                    )
+
+
+                    if available_at_utc is None:
+
+                        row_ok = False
+
+                        continue
+
+
+                    # We only need availableAt for
+                    # leakage checking.
+                    #
+                    # feature_info["value"] is deliberately
+                    # ignored.
+                    parsed_features[
+                        feature_name
+                    ] = {
+                        "availableAt":
+                            available_at_utc
+                    }
+
+
+            # ---------------------------------------------
+            # Keep only completely valid rows
+            # ---------------------------------------------
+
+            if row_ok:
+
+                parsed_rows.append({
+
+                    "id":
+                        row_id,
+
+                    "entity":
+                        entity,
+
+                    "eventTime":
+                        event_time_utc,
+
+                    "predictionTime":
+                        prediction_time_utc,
+
+                    "version":
+                        version,
+
+                    "split":
+                        split,
+
+                    "features":
+                        parsed_features,
+                })
+
+
+            else:
+
+                rows_structurally_valid = False
+
+
+    # Any bad row makes the whole selection malformed.
+    if not rows_structurally_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # 5. Validate trials
+    # -----------------------------------------------------
+
+    trials = body.get("trials")
+
+
+    trials_container_valid = isinstance(
+        trials,
+        list
+    )
+
+
+    if not trials_container_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    parsed_trials = []
+
+    seen_trial_ids = set()
+
+    trials_structurally_valid = (
+        trials_container_valid
+    )
+
+
+    if trials_container_valid:
+
+
+        # ---------------------------------------------
+        # Trial count contract
+        # ---------------------------------------------
+
+        if (
+            num_trials_limit_valid
+            and len(trials)
+            > num_trials_limit
+        ):
+
+            reason_codes.append(
+                "TRIAL_LIMIT_EXCEEDED"
+            )
+
+
+        # ---------------------------------------------
+        # Validate every trial
+        # ---------------------------------------------
+
+        for trial in trials:
+
+
+            trial_ok = isinstance(
+                trial,
+                dict
+            )
+
+
+            if not trial_ok:
+
+                trials_structurally_valid = False
+
+                continue
+
+
+            trial_id = trial.get(
+                "trialId"
+            )
+
+            status = trial.get(
+                "status"
+            )
+
+            eval_metric = trial.get(
+                "evalMetric"
+            )
+
+
+            # Trial ID must be a non-negative
+            # safe integer and unique.
+            if not bqml_is_safe_int(
+                trial_id
+            ):
+
+                trial_ok = False
+
+
+            elif trial_id in seen_trial_ids:
+
+                trial_ok = False
+
+
+            else:
+
+                seen_trial_ids.add(
+                    trial_id
+                )
+
+
+            # Only these two statuses exist.
+            if status not in (
+                "SUCCEEDED",
+                "FAILED"
+            ):
+
+                trial_ok = False
+
+
+            if trial_ok:
+
+                parsed_trials.append({
+
+                    "trialId":
+                        trial_id,
+
+                    "status":
+                        status,
+
+                    # We do not validate this as a
+                    # model metric yet.
+                    #
+                    # A SUCCEEDED trial is eligible
+                    # only if this later turns out
+                    # to be finite.
+                    "evalMetric":
+                        eval_metric,
+                })
+
+
+            else:
+
+                trials_structurally_valid = False
+
+
+    if not trials_structurally_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # Determine whether selection itself is malformed.
+    #
+    # TRIAL_LIMIT_EXCEEDED is a contract gate, but the
+    # row dataset can still be deterministically built.
+    #
+    # NO_SUCCESSFUL_TRIAL also does not make the row
+    # dataset malformed.
+    # -----------------------------------------------------
+
+    malformed = (
+        "INVALID_INPUT"
+        in reason_codes
+    )
+
+
+    # Default response artifacts.
+    train_row_ids = []
+
+    eval_row_ids = []
+
+    feature_names = []
+
+    dataset_digest = None
+
+    selected_trial_id = None
+
+
+    # =====================================================
+    # Only process the dataset when selection input itself
+    # is structurally valid.
+    # =====================================================
+
+    if not malformed:
+
+
+        # -------------------------------------------------
+        # 6. Deduplicate rows
+        #
+        # Key:
+        # [entity, UTC(eventTime)]
+        #
+        # Winner:
+        # 1. highest version
+        # 2. UTF-8-byte-smallest ID
+        # -------------------------------------------------
+
+        row_groups = {}
+
+
+        for row in parsed_rows:
+
+            dedup_key = (
+                row["entity"],
+                row["eventTime"]
+            )
+
+
+            row_groups.setdefault(
+                dedup_key,
+                []
+            ).append(row)
+
+
+        retained_rows = []
+
+
+        for group in row_groups.values():
+
+
+            ordered_group = sorted(
+
+                group,
+
+                key=lambda row: (
+
+                    # Highest version first.
+                    -row["version"],
+
+                    # Then smallest UTF-8 ID.
+                    row["id"].encode(
+                        "utf-8"
+                    ),
+                )
+            )
+
+
+            # First row is winner.
+            retained_rows.append(
+                ordered_group[0]
+            )
+
+
+        # -------------------------------------------------
+        # 7. Split IDs
+        #
+        # Selection only knows:
+        #
+        # TRAIN
+        # EVAL
+        #
+        # Never TEST.
+        # -------------------------------------------------
+
+        train_row_ids = sorted(
+
+            [
+                row["id"]
+                for row in retained_rows
+                if row["split"] == "TRAIN"
+            ],
+
+            key=lambda value:
+                value.encode("utf-8")
+        )
+
+
+        eval_row_ids = sorted(
+
+            [
+                row["id"]
+                for row in retained_rows
+                if row["split"] == "EVAL"
+            ],
+
+            key=lambda value:
+                value.encode("utf-8")
+        )
+
+
+        # -------------------------------------------------
+        # 8. Find features appearing in EVERY retained row
+        # -------------------------------------------------
+
+        common_features = set(
+            retained_rows[0][
+                "features"
+            ].keys()
+        )
+
+
+        for row in retained_rows[1:]:
+
+            common_features &= set(
+                row["features"].keys()
+            )
+
+
+        eligible_features = []
+
+
+        # -------------------------------------------------
+        # 9. Point-in-time / leakage test
+        #
+        # Feature is eligible only when:
+        #
+        # feature availableAt <= predictionTime
+        #
+        # for EVERY retained row.
+        # -------------------------------------------------
+
+        for feature_name in common_features:
+
+
+            # Forbidden feature can never enter training.
+            if feature_name in forbidden_set:
+
+                continue
+
+
+            point_in_time_safe = all(
+
+                row[
+                    "features"
+                ][
+                    feature_name
+                ][
+                    "availableAt"
+                ]
+
+                <=
+
+                row[
+                    "predictionTime"
+                ]
+
+                for row in retained_rows
+            )
+
+
+            if point_in_time_safe:
+
+                eligible_features.append(
+                    feature_name
+                )
+
+
+        # Required UTF-8 ordering.
+        feature_names = sorted(
+
+            eligible_features,
+
+            key=lambda value:
+                value.encode("utf-8")
+        )
+
+
+        # -------------------------------------------------
+        # 10. Freeze dataset digest
+        # -------------------------------------------------
+
+        dataset_digest = (
+            bqml_make_dataset_digest(
+                train_row_ids,
+                eval_row_ids,
+                feature_names
+            )
+        )
+
+
+        # -------------------------------------------------
+        # AUDIT THE INTERNAL FROZEN DATASET
+        # -------------------------------------------------
+
+        audit(
+            request_id,
+            "BQML_SELECT_DATASET",
+            {
+                "retainedRows": [
+                    {
+                        "id": row["id"],
+                        "entity": row["entity"],
+                        "eventTime":
+                            row["eventTime"],
+                        "predictionTime":
+                            row["predictionTime"],
+                        "version":
+                            row["version"],
+                        "split":
+                            row["split"],
+                    }
+                    for row in retained_rows
+                ],
+                "trainRowIds":
+                    train_row_ids,
+                "evalRowIds":
+                    eval_row_ids,
+                "featureNames":
+                    feature_names,
+                "datasetDigest":
+                    dataset_digest,
+            }
+        )
+
+
+        # -------------------------------------------------
+        # 11. Find eligible trials
+        #
+        # Eligible only if:
+        #
+        # status == SUCCEEDED
+        # AND evalMetric is finite
+        # -------------------------------------------------
+
+        eligible_trials = []
+
+
+        for trial in parsed_trials:
+
+            metric = trial[
+                "evalMetric"
+            ]
+
+
+            if (
+                trial["status"]
+                == "SUCCEEDED"
+
+                and bqml_is_number(
+                    metric
+                )
+
+                and math.isfinite(
+                    float(metric)
+                )
+            ):
+
+                eligible_trials.append(
+                    trial
+                )
+
+
+        # -------------------------------------------------
+        # 12. Select trial
+        # -------------------------------------------------
+
+        if len(eligible_trials) == 0:
+
+            reason_codes.append(
+                "NO_SUCCESSFUL_TRIAL"
+            )
+
+
+        else:
+
+            # Maximize evalMetric.
+            #
+            # Exact tie:
+            # smallest integer trialId wins.
+            ordered_trials = sorted(
+
+                eligible_trials,
+
+                key=lambda trial: (
+
+                    -float(
+                        trial[
+                            "evalMetric"
+                        ]
+                    ),
+
+                    trial[
+                        "trialId"
+                    ],
+                )
+            )
+
+
+            selected_trial_id = (
+                ordered_trials[0][
+                    "trialId"
+                ]
+            )
+
+
+    # -----------------------------------------------------
+    # Sort + deduplicate reason codes.
+    # -----------------------------------------------------
+
+    reason_codes = bqml_sort_codes(
+        reason_codes
+    )
+
+
+    # ANY reason code means selectedTrialId MUST be null.
+    if reason_codes:
+
+        selected_trial_id = None
+
+
+    # -----------------------------------------------------
+    # EXACT SELECT RESPONSE SHAPE
+    # -----------------------------------------------------
+
+    response = {
+
+        "runId":
+            (
+                run_id
+                if isinstance(run_id, str)
+                else None
+            ),
+
+        "selectedTrialId":
+            selected_trial_id,
+
+        "trainRowIds":
+            train_row_ids,
+
+        "evalRowIds":
+            eval_row_ids,
+
+        "featureNames":
+            feature_names,
+
+        "datasetDigest":
+            dataset_digest,
+
+        "reasonCodes":
+            reason_codes,
+    }
+
+
+    # -----------------------------------------------------
+    # AUDIT
+    # -----------------------------------------------------
+
+    audit(
+        request_id,
+        "BQML_SELECT_RESPONSE",
+        response
+    )
+
+
+    return response
+
+
+# =========================================================
+# EVALUATE PHASE
+# =========================================================
+
+def bqml_process_evaluate(
+    body,
+    request_id
+):
+
+    reason_codes = []
+
+
+    # -----------------------------------------------------
+    # Read frozen lineage supplied by caller
+    # -----------------------------------------------------
+
+    run_id = body.get(
+        "runId"
+    )
+
+    selected_trial_id = body.get(
+        "selectedTrialId"
+    )
+
+    dataset_digest = body.get(
+        "datasetDigest"
+    )
+
+
+    # -----------------------------------------------------
+    # 1. Validate lineage field FORMATS
+    # -----------------------------------------------------
+
+    run_id_format_valid = (
+        bqml_utf8_ok(run_id)
+        and 1 <= len(run_id) <= 128
+    )
+
+
+    trial_id_format_valid = (
+        bqml_is_safe_int(
+            selected_trial_id
+        )
+    )
+
+
+    digest_format_valid = (
+        isinstance(
+            dataset_digest,
+            str
+        )
+        and BQML_DIGEST_RE.fullmatch(
+            dataset_digest
+        )
+        is not None
+    )
+
+
+    if not (
+        run_id_format_valid
+        and trial_id_format_valid
+        and digest_format_valid
+    ):
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # 2. metricFloor
+    # -----------------------------------------------------
+
+    metric_floor = body.get(
+        "metricFloor"
+    )
+
+
+    metric_floor_valid = (
+        bqml_is_finite_unit(
+            metric_floor
+        )
+    )
+
+
+    if not metric_floor_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    else:
+
+        metric_floor = float(
+            metric_floor
+        )
+
+
+    # -----------------------------------------------------
+    # 3. requiredSlices
+    #
+    # Example:
+    #
+    # {
+    #   "critical": 0.75,
+    #   "vip": 0.80
+    # }
+    # -----------------------------------------------------
+
+    required_slices = body.get(
+        "requiredSlices"
+    )
+
+
+    required_slices_valid = isinstance(
+        required_slices,
+        dict
+    )
+
+
+    normalized_required_slices = {}
+
+
+    if required_slices_valid:
+
+        for (
+            slice_name,
+            slice_floor
+        ) in required_slices.items():
+
+
+            if (
+                not bqml_utf8_ok(
+                    slice_name
+                )
+
+                or slice_name == ""
+
+                or not bqml_is_finite_unit(
+                    slice_floor
+                )
+            ):
+
+                required_slices_valid = False
+
+                break
+
+
+            normalized_required_slices[
+                slice_name
+            ] = float(
+                slice_floor
+            )
+
+
+    if not required_slices_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+        normalized_required_slices = {}
+
+
+    # -----------------------------------------------------
+    # 4. Validate byte fields
+    # -----------------------------------------------------
+
+    bytes_processed = body.get(
+        "bytesProcessed"
+    )
+
+
+    max_bytes = body.get(
+        "maxBytes"
+    )
+
+
+    bytes_valid = (
+        bqml_is_safe_int(
+            bytes_processed
+        )
+        and bqml_is_safe_int(
+            max_bytes
+        )
+    )
+
+
+    if not bytes_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    # -----------------------------------------------------
+    # 5. Check frozen lineage
+    # -----------------------------------------------------
+
+    lineage_valid = False
+
+
+    # Only attempt exact matching when the three
+    # lineage fields themselves have valid formats.
+    if (
+        run_id_format_valid
+        and trial_id_format_valid
+        and digest_format_valid
+    ):
+
+
+        stored_run = BQML_RUN_STORE.get(
+            run_id
+        )
+
+
+        if stored_run is not None:
+
+
+            stored_response = (
+                stored_run[
+                    "response"
+                ]
+            )
+
+
+            # Evaluation may use ONLY a completely
+            # successful stored selection.
+            stored_selection_successful = (
+
+                stored_response[
+                    "selectedTrialId"
+                ]
+                is not None
+
+                and
+
+                stored_response[
+                    "datasetDigest"
+                ]
+                is not None
+
+                and
+
+                stored_response[
+                    "reasonCodes"
+                ]
+                == []
+            )
+
+
+            if stored_selection_successful:
+
+
+                lineage_valid = (
+
+                    stored_response[
+                        "selectedTrialId"
+                    ]
+                    == selected_trial_id
+
+                    and
+
+                    stored_response[
+                        "datasetDigest"
+                    ]
+                    == dataset_digest
+                )
+
+
+        # Validly formatted lineage that doesn't exactly
+        # match a successful stored selection is
+        # INVALID_LINEAGE.
+        if not lineage_valid:
+
+            reason_codes.append(
+                "INVALID_LINEAGE"
+            )
+
+
+    # -----------------------------------------------------
+    # 6. BYTE LIMIT
+    #
+    # Byte checking still happens even if test rows
+    # are empty or invalid.
+    # -----------------------------------------------------
+
+    if (
+        bytes_valid
+        and bytes_processed > max_bytes
+    ):
+
+        reason_codes.append(
+            "BYTE_LIMIT"
+        )
+
+
+    # -----------------------------------------------------
+    # 7. Validate final-test rows
+    # -----------------------------------------------------
+
+    rows = body.get("rows")
+
+
+    rows_container_valid = isinstance(
+        rows,
+        list
+    )
+
+
+    if not rows_container_valid:
+
+        reason_codes.append(
+            "INVALID_INPUT"
+        )
+
+
+    valid_test_rows = []
+
+    any_invalid_test_row = False
+
+
+    if rows_container_valid:
+
+        for row in rows:
+
+
+            row_ok = isinstance(
+                row,
+                dict
+            )
+
+
+            if row_ok:
+
+
+                label = row.get(
+                    "label"
+                )
+
+
+                prediction = row.get(
+                    "prediction"
+                )
+
+
+                slice_name = row.get(
+                    "slice"
+                )
+
+
+                # Label must be integer 0 or 1.
+                label_ok = (
+
+                    isinstance(
+                        label,
+                        int
+                    )
+
+                    and not isinstance(
+                        label,
+                        bool
+                    )
+
+                    and label in (
+                        0,
+                        1
+                    )
+                )
+
+
+                # Prediction must be integer 0 or 1.
+                prediction_ok = (
+
+                    isinstance(
+                        prediction,
+                        int
+                    )
+
+                    and not isinstance(
+                        prediction,
+                        bool
+                    )
+
+                    and prediction in (
+                        0,
+                        1
+                    )
+                )
+
+
+                # Slice must be a non-empty UTF-8 string.
+                slice_ok = (
+
+                    bqml_utf8_ok(
+                        slice_name
+                    )
+
+                    and slice_name != ""
+                )
+
+
+                row_ok = (
+                    label_ok
+                    and prediction_ok
+                    and slice_ok
+                )
+
+
+            # ---------------------------------------------
+            # Invalid row
+            # ---------------------------------------------
+
+            if not row_ok:
+
+                any_invalid_test_row = True
+
+
+            # ---------------------------------------------
+            # Valid row
+            # ---------------------------------------------
+
+            else:
+
+                valid_test_rows.append({
+
+                    "label":
+                        label,
+
+                    "prediction":
+                        prediction,
+
+                    "slice":
+                        slice_name,
+                })
+
+
+    if any_invalid_test_row:
+
+        reason_codes.append(
+            "INVALID_TEST_ROW"
+        )
+
+
+    # -----------------------------------------------------
+    # 8. Decide whether metrics may be calculated
+    #
+    # IMPORTANT:
+    #
+    # If rows are EMPTY
+    # OR any test row is INVALID:
+    #
+    # testMetric = null
+    #
+    # and skip aggregate/slice checks.
+    # -----------------------------------------------------
+
+    can_score = (
+
+        rows_container_valid
+
+        and len(rows) > 0
+
+        and not any_invalid_test_row
+    )
+
+
+    test_metric = None
+
+
+    # Used for debugging.
+    slice_metrics = {}
+
+
+    # -----------------------------------------------------
+    # 9. Aggregate accuracy
+    # -----------------------------------------------------
+
+    if can_score:
+
+
+        correct_predictions = sum(
+
+            1
+
+            for row in valid_test_rows
+
+            if (
+                row["label"]
+                == row["prediction"]
+            )
+        )
+
+
+        test_metric = round(
+
+            correct_predictions
+            / len(valid_test_rows),
+
+            12
+        )
+
+
+        # Aggregate gate.
+        if (
+            metric_floor_valid
+            and test_metric < metric_floor
+        ):
+
+            reason_codes.append(
+                "AGGREGATE_FLOOR"
+            )
+
+
+        # -------------------------------------------------
+        # 10. Required slice accuracy
+        # -------------------------------------------------
+
+        if required_slices_valid:
+
+
+            sorted_required_names = sorted(
+
+                normalized_required_slices.keys(),
+
+                key=lambda value:
+                    value.encode("utf-8")
+            )
+
+
+            for slice_name in sorted_required_names:
+
+
+                matching_rows = [
+
+                    row
+
+                    for row in valid_test_rows
+
+                    if (
+                        row["slice"]
+                        == slice_name
+                    )
+                ]
+
+
+                # -----------------------------------------
+                # Required slice does not exist
+                # -----------------------------------------
+
+                if len(matching_rows) == 0:
+
+
+                    reason_codes.append(
+
+                        "MISSING_SLICE:"
+                        + slice_name
+                    )
+
+
+                    slice_metrics[
+                        slice_name
+                    ] = None
+
+
+                    continue
+
+
+                # -----------------------------------------
+                # Calculate required-slice accuracy
+                # -----------------------------------------
+
+                correct_in_slice = sum(
+
+                    1
+
+                    for row in matching_rows
+
+                    if (
+                        row["label"]
+                        == row["prediction"]
+                    )
+                )
+
+
+                slice_accuracy = round(
+
+                    correct_in_slice
+                    / len(matching_rows),
+
+                    12
+                )
+
+
+                slice_metrics[
+                    slice_name
+                ] = slice_accuracy
+
+
+                required_floor = (
+                    normalized_required_slices[
+                        slice_name
+                    ]
+                )
+
+
+                # Inclusive threshold:
+                #
+                # equal floor passes.
+                if (
+                    slice_accuracy
+                    < required_floor
+                ):
+
+                    reason_codes.append(
+
+                        "SLICE_FLOOR:"
+                        + slice_name
+                    )
+
+
+    # -----------------------------------------------------
+    # 11. criticalSlicePass
+    #
+    # It becomes FALSE for:
+    #
+    # INVALID_INPUT
+    # INVALID_LINEAGE
+    # INVALID_TEST_ROW
+    # MISSING_SLICE:...
+    # SLICE_FLOOR:...
+    #
+    # It deliberately does NOT summarize:
+    #
+    # AGGREGATE_FLOOR
+    # BYTE_LIMIT
+    # -----------------------------------------------------
+
+    critical_slice_pass = True
+
+
+    if (
+        "INVALID_INPUT"
+        in reason_codes
+
+        or "INVALID_LINEAGE"
+        in reason_codes
+
+        or "INVALID_TEST_ROW"
+        in reason_codes
+    ):
+
+        critical_slice_pass = False
+
+
+    for code in reason_codes:
+
+
+        if (
+            code.startswith(
+                "MISSING_SLICE:"
+            )
+
+            or code.startswith(
+                "SLICE_FLOOR:"
+            )
+        ):
+
+            critical_slice_pass = False
+
+
+    # -----------------------------------------------------
+    # 12. Sort + deduplicate reason codes
+    # -----------------------------------------------------
+
+    reason_codes = bqml_sort_codes(
+        reason_codes
+    )
+
+
+    # -----------------------------------------------------
+    # 13. Final admission decision
+    #
+    # Rows must actually be scoreable.
+    #
+    # So an empty test set rejects even though there
+    # is no special EMPTY_ROWS reason code.
+    # -----------------------------------------------------
+
+    decision = "reject"
+
+
+    if (
+        len(reason_codes) == 0
+
+        and can_score
+
+        and test_metric is not None
+    ):
+
+        decision = "admit"
+
+
+    # -----------------------------------------------------
+    # EXACT EVALUATE RESPONSE SHAPE
+    # -----------------------------------------------------
+
+    response = {
+
+        "runId":
+            (
+                run_id
+                if isinstance(
+                    run_id,
+                    str
+                )
+                else None
+            ),
+
+        "selectedTrialId":
+            (
+                selected_trial_id
+                if trial_id_format_valid
+                else None
+            ),
+
+        "datasetDigest":
+            (
+                dataset_digest
+                if digest_format_valid
+                else None
+            ),
+
+        "testMetric":
+            test_metric,
+
+        "criticalSlicePass":
+            critical_slice_pass,
+
+        "decision":
+            decision,
+
+        "bytesProcessed":
+            (
+                bytes_processed
+                if bqml_is_safe_int(
+                    bytes_processed
+                )
+                else None
+            ),
+
+        "reasonCodes":
+            reason_codes,
+    }
+
+
+    # -----------------------------------------------------
+    # AUDIT
+    # -----------------------------------------------------
+
+    audit(
+        request_id,
+        "BQML_EVALUATE_RESPONSE",
+        {
+            "lineageValid":
+                lineage_valid,
+
+            "canScore":
+                can_score,
+
+            "sliceMetrics":
+                slice_metrics,
+
+            "response":
+                response,
+        }
+    )
+
+
+    return response
+
+
+# =========================================================
+# MAIN /bqml ENDPOINT
+# =========================================================
+
+@app.post("/bqml")
+async def bqml_endpoint(
+    request: Request
+):
+
+
+    # Unique ID for this HTTP request.
+    # All audit lines for this request will share it.
+    request_id = (
+        uuid.uuid4().hex[:8]
+    )
+
+
+    # -----------------------------------------------------
+    # 1. Strict request parsing
+    # -----------------------------------------------------
+
+    try:
+
+
+        # Exact HTTP bytes.
+        raw_body = await request.body()
+
+
+        audit(
+            request_id,
+            "BQML_HTTP_REQUEST",
+            {
+                "contentType":
+                    request.headers.get(
+                        "content-type"
+                    ),
+
+                "rawBody":
+                    repr(raw_body),
+            }
+        )
+
+
+        # JSON request must be UTF-8.
+        body_text = raw_body.decode(
+            "utf-8"
+        )
+
+
+        # Reuse strict parser from Q1.
+        #
+        # This rejects invalid JSON constants such as:
+        #
+        # NaN
+        # Infinity
+        # -Infinity
+        body = strict_json_loads(
+            body_text
+        )
+
+
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+
+
+        audit(
+            request_id,
+            "BQML_PARSE_FAILED",
+            {
+                "type":
+                    type(exc).__name__,
+
+                "message":
+                    str(exc),
+            }
+        )
+
+
+        return JSONResponse(
+
+            status_code=400,
+
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # Audit parsed request
+    # -----------------------------------------------------
+
+    audit(
+        request_id,
+        "BQML_REQUEST_PARSED",
+        body
+    )
+
+
+    # -----------------------------------------------------
+    # 2. Top-level JSON must be an object.
+    # -----------------------------------------------------
+
+    if not isinstance(
+        body,
+        dict
+    ):
+
+
+        return JSONResponse(
+
+            status_code=400,
+
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # 3. Phase routing
+    # -----------------------------------------------------
+
+    phase = body.get(
+        "phase"
+    )
+
+
+    # Missing or unknown phase:
+    #
+    # HTTP 400
+    # exactly {"error":"INVALID_INPUT"}
+    if phase not in (
+        "select",
+        "evaluate"
+    ):
+
+
+        audit(
+            request_id,
+            "BQML_INVALID_PHASE",
+            {
+                "phase":
+                    phase
+            }
+        )
+
+
+        return JSONResponse(
+
+            status_code=400,
+
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # =====================================================
+    # SELECT
+    # =====================================================
+
+    if phase == "select":
+
+
+        run_id = body.get(
+            "runId"
+        )
+
+
+        # Internal fingerprint tells whether this is
+        # an identical replay.
+        fingerprint = (
+            bqml_selection_fingerprint(
+                body
+            )
+        )
+
+
+        # -------------------------------------------------
+        # Existing runId?
+        # -------------------------------------------------
+
+        if (
+            bqml_utf8_ok(
+                run_id
+            )
+
+            and 1 <= len(
+                run_id
+            ) <= 128
+
+            and run_id
+            in BQML_RUN_STORE
+        ):
+
+
+            stored = (
+                BQML_RUN_STORE[
+                    run_id
+                ]
+            )
+
+
+            # ---------------------------------------------
+            # IDENTICAL REPLAY
+            #
+            # Return exactly the already frozen response.
+            # ---------------------------------------------
+
+            if (
+                stored[
+                    "fingerprint"
+                ]
+                == fingerprint
+            ):
+
+
+                audit(
+                    request_id,
+                    "BQML_SELECT_REPLAY",
+                    {
+                        "runId":
+                            run_id,
+
+                        "response":
+                            stored[
+                                "response"
+                            ],
+                    }
+                )
+
+
+                return stored[
+                    "response"
+                ]
+
+
+            # ---------------------------------------------
+            # SAME runId + DIFFERENT selection input
+            #
+            # HTTP 409 exactly:
+            #
+            # {"error":"RUN_ID_CONFLICT"}
+            # ---------------------------------------------
+
+            audit(
+                request_id,
+                "BQML_RUN_ID_CONFLICT",
+                {
+                    "runId":
+                        run_id
+                }
+            )
+
+
+            return JSONResponse(
+
+                status_code=409,
+
+                content={
+                    "error":
+                        "RUN_ID_CONFLICT"
+                }
+            )
+
+
+        # -------------------------------------------------
+        # New selection
+        # -------------------------------------------------
+
+        response = bqml_process_select(
+            body,
+            request_id
+        )
+
+
+        # -------------------------------------------------
+        # Persist complete selection response under runId.
+        #
+        # We can only persist when runId itself is a
+        # valid usable key.
+        # -------------------------------------------------
+
+        if (
+            bqml_utf8_ok(
+                run_id
+            )
+
+            and 1 <= len(
+                run_id
+            ) <= 128
+        ):
+
+
+            BQML_RUN_STORE[
+                run_id
+            ] = {
+
+                "fingerprint":
+                    fingerprint,
+
+                "response":
+                    response,
+            }
+
+
+            audit(
+                request_id,
+                "BQML_SELECT_STORED",
+                {
+                    "runId":
+                        run_id,
+
+                    "response":
+                        response,
+                }
+            )
+
+
+        return response
+
+
+    # =====================================================
+    # EVALUATE
+    # =====================================================
+
+    return bqml_process_evaluate(
+        body,
+        request_id
+    )
