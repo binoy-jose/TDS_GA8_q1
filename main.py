@@ -5960,7 +5960,7 @@ async def promote_endpoint(
 
 
 # ---------------------------------------------------------
-# PUBLISHED INTERVENTION PRIORITY
+# Published priority order
 # ---------------------------------------------------------
 
 ADAPT_PRIORITY = [
@@ -5972,7 +5972,7 @@ ADAPT_PRIORITY = [
 
 
 # ---------------------------------------------------------
-# LINEAGE REGEXES
+# Lineage regexes
 # ---------------------------------------------------------
 
 ADAPT_BASE_REVISION_RE = re.compile(
@@ -5985,7 +5985,7 @@ ADAPT_DIGEST_RE = re.compile(
 
 
 # ---------------------------------------------------------
-# REQUIRED ADAPTER FILES
+# Exact adapter files
 # ---------------------------------------------------------
 
 ADAPT_REQUIRED_FILES = [
@@ -5995,7 +5995,7 @@ ADAPT_REQUIRED_FILES = [
 
 
 # ---------------------------------------------------------
-# CHECKPOINT KEYS
+# Required checkpoint keys
 # ---------------------------------------------------------
 
 ADAPT_CHECKPOINT_KEYS = {
@@ -6014,7 +6014,7 @@ ADAPT_CHECKPOINT_KEYS = {
 
 def adapt_is_number(value):
     """
-    Numeric value, excluding Boolean.
+    int/float but NOT bool.
     """
 
     return (
@@ -6071,26 +6071,34 @@ def adapt_is_safe_positive_int(value):
 
 def adapt_is_utf8_string(value):
     """
-    Valid UTF-8 encodable Python string.
+    String that can be encoded as UTF-8.
     """
 
     if not isinstance(value, str):
         return False
 
     try:
-
         value.encode("utf-8")
-
         return True
 
     except UnicodeEncodeError:
-
         return False
+
+
+def adapt_is_nonempty_utf8_string(value):
+    """
+    Non-empty UTF-8 string.
+    """
+
+    return (
+        adapt_is_utf8_string(value)
+        and value != ""
+    )
 
 
 def adapt_sort_codes(codes):
     """
-    Sort + deduplicate codes by UTF-8 bytes.
+    Sort + deduplicate codes using UTF-8 bytes.
     """
 
     return sorted(
@@ -6105,18 +6113,8 @@ def adapt_sort_codes(codes):
 # =========================================================
 
 def adapt_validate_choose_policy(policy):
-    """
-    Validate the complete intervention policy.
-
-    Returns:
-        (True, normalized_policy)
-
-    or:
-        (False, None)
-    """
 
     if not isinstance(policy, dict):
-
         return False, None
 
 
@@ -6149,71 +6147,57 @@ def adapt_validate_choose_policy(policy):
     )
 
 
-    # Quality floor must be finite [0,1].
+    # minQuality must be finite [0,1].
     if (
         not adapt_is_finite_number(
             min_quality
         )
         or not (
-            0.0
-            <= float(min_quality)
-            <= 1.0
+            0.0 <= float(min_quality) <= 1.0
         )
     ):
-
         return False, None
 
 
-    # Freshness requirement must really be Boolean.
+    # Must really be Boolean.
     if not isinstance(
         freshness_required,
         bool
     ):
-
         return False, None
 
 
-    # Latency ceiling.
     if not adapt_is_nonnegative_finite(
         max_latency
     ):
-
         return False, None
 
 
-    # Memory ceiling.
     if not adapt_is_nonnegative_finite(
         max_memory
     ):
-
         return False, None
 
 
-    # Labeled examples ceiling.
     if not adapt_is_safe_nonnegative_int(
         max_labeled
     ):
-
         return False, None
 
 
-    # Total cost ceiling.
     if not adapt_is_nonnegative_finite(
         max_total_cost
     ):
-
         return False, None
 
 
-    # Horizon request count.
     if not adapt_is_safe_nonnegative_int(
         horizon
     ):
-
         return False, None
 
 
-    normalized = {
+    return True, {
 
         "minQuality":
             float(min_quality),
@@ -6238,50 +6222,23 @@ def adapt_validate_choose_policy(policy):
     }
 
 
-    return True, normalized
+def adapt_candidate_structure_valid(candidate):
 
-
-def adapt_candidate_structure_valid(
-    candidate
-):
-    """
-    Validate a candidate's field TYPES/RANGES.
-
-    Gate failures such as low quality are NOT structural
-    failures. Those are checked separately.
-    """
-
-    if not isinstance(
-        candidate,
-        dict
-    ):
-
+    if not isinstance(candidate, dict):
         return False
 
 
-    name = candidate.get(
-        "name"
-    )
+    name = candidate.get("name")
 
-    available = candidate.get(
-        "available"
-    )
+    available = candidate.get("available")
 
-    quality = candidate.get(
-        "quality"
-    )
+    quality = candidate.get("quality")
 
-    freshness = candidate.get(
-        "freshness"
-    )
+    freshness = candidate.get("freshness")
 
-    latency = candidate.get(
-        "latencyMs"
-    )
+    latency = candidate.get("latencyMs")
 
-    memory = candidate.get(
-        "memoryMb"
-    )
+    memory = candidate.get("memoryMb")
 
     labeled = candidate.get(
         "labeledExamples"
@@ -6297,7 +6254,6 @@ def adapt_candidate_structure_valid(
 
 
     if name not in ADAPT_PRIORITY:
-
         return False
 
 
@@ -6305,7 +6261,6 @@ def adapt_candidate_structure_valid(
         available,
         bool
     ):
-
         return False
 
 
@@ -6314,12 +6269,9 @@ def adapt_candidate_structure_valid(
             quality
         )
         or not (
-            0.0
-            <= float(quality)
-            <= 1.0
+            0.0 <= float(quality) <= 1.0
         )
     ):
-
         return False
 
 
@@ -6327,42 +6279,36 @@ def adapt_candidate_structure_valid(
         freshness,
         bool
     ):
-
         return False
 
 
     if not adapt_is_nonnegative_finite(
         latency
     ):
-
         return False
 
 
     if not adapt_is_nonnegative_finite(
         memory
     ):
-
         return False
 
 
     if not adapt_is_safe_nonnegative_int(
         labeled
     ):
-
         return False
 
 
     if not adapt_is_nonnegative_finite(
         one_time
     ):
-
         return False
 
 
     if not adapt_is_nonnegative_finite(
         recurring
     ):
-
         return False
 
 
@@ -6376,9 +6322,7 @@ def adapt_process_choose(
 
     policy_valid, policy = (
         adapt_validate_choose_policy(
-            body.get(
-                "policy"
-            )
+            body.get("policy")
         )
     )
 
@@ -6388,10 +6332,7 @@ def adapt_process_choose(
     )
 
 
-    # -----------------------------------------------------
-    # Initialize exact required output dictionaries.
-    # -----------------------------------------------------
-
+    # Exact output dictionaries.
     total_costs = {
         name: None
         for name in ADAPT_PRIORITY
@@ -6404,15 +6345,8 @@ def adapt_process_choose(
     }
 
 
-    # -----------------------------------------------------
-    # Validate the candidates container.
-    # -----------------------------------------------------
-
     candidate_contract_valid = (
-        isinstance(
-            candidates,
-            list
-        )
+        isinstance(candidates, list)
     )
 
 
@@ -6421,17 +6355,14 @@ def adapt_process_choose(
 
     if candidate_contract_valid:
 
-
-        # Exactly FOUR candidates are required.
+        # Exactly four candidates.
         if len(candidates) != 4:
 
             candidate_contract_valid = False
 
-
         else:
 
             for candidate in candidates:
-
 
                 if not isinstance(
                     candidate,
@@ -6439,7 +6370,6 @@ def adapt_process_choose(
                 ):
 
                     candidate_contract_valid = False
-
                     continue
 
 
@@ -6448,19 +6378,16 @@ def adapt_process_choose(
                 )
 
 
-                # Name must be one of the four known names.
                 if name not in ADAPT_PRIORITY:
 
                     candidate_contract_valid = False
-
                     continue
 
 
-                # Exactly one candidate per intervention.
+                # Duplicate candidate name.
                 if name in candidate_map:
 
                     candidate_contract_valid = False
-
                     continue
 
 
@@ -6469,7 +6396,7 @@ def adapt_process_choose(
                 ] = candidate
 
 
-            # All four must be present.
+            # Must contain exactly all four.
             if set(
                 candidate_map.keys()
             ) != set(
@@ -6479,12 +6406,7 @@ def adapt_process_choose(
                 candidate_contract_valid = False
 
 
-    # -----------------------------------------------------
-    # Global malformed choose request.
-    #
-    # INVALID_INPUT applies to all four output names.
-    # -----------------------------------------------------
-
+    # Malformed policy or candidate contract.
     if (
         not policy_valid
         or not candidate_contract_valid
@@ -6499,21 +6421,15 @@ def adapt_process_choose(
             )
 
 
-    # -----------------------------------------------------
-    # Evaluate each of the four named candidates.
-    # -----------------------------------------------------
-
+    # Evaluate each intervention.
     for name in ADAPT_PRIORITY:
-
 
         candidate = candidate_map.get(
             name
         )
 
 
-        # Missing candidate.
         if candidate is None:
-
             continue
 
 
@@ -6535,49 +6451,44 @@ def adapt_process_choose(
             continue
 
 
-        # -------------------------------------------------
-        # Calculate total cost when policy horizon itself
-        # is valid.
-        # -------------------------------------------------
+        # ---------------------------------------------
+        # Total cost
+        # ---------------------------------------------
 
         if policy_valid:
 
-            one_time = float(
-                candidate[
-                    "oneTimeCost"
-                ]
-            )
-
-            recurring = float(
-                candidate[
-                    "recurringCost"
-                ]
-            )
-
-
             total = (
-                one_time
-                + (
+
+                float(
+                    candidate[
+                        "oneTimeCost"
+                    ]
+                )
+
+                +
+
+                (
                     policy[
                         "horizonRequests"
                     ]
-                    * recurring
+
+                    * float(
+                        candidate[
+                            "recurringCost"
+                        ]
+                    )
                 )
             )
 
 
-            # Guard against numeric overflow.
             if math.isfinite(total):
-
-                total = round(
-                    total,
-                    12
-                )
 
                 total_costs[
                     name
-                ] = total
-
+                ] = round(
+                    total,
+                    12
+                )
 
             else:
 
@@ -6588,15 +6499,13 @@ def adapt_process_choose(
                 )
 
 
-        # If policy is malformed, we cannot apply gates.
         if not policy_valid:
-
             continue
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Availability
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if candidate[
             "available"
@@ -6609,9 +6518,9 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Quality
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if (
             float(
@@ -6631,9 +6540,9 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Freshness
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if (
             policy[
@@ -6651,9 +6560,9 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Latency
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if (
             float(
@@ -6673,9 +6582,9 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Memory
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if (
             float(
@@ -6695,9 +6604,9 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
+        # ---------------------------------------------
         # Labeled data
-        # -------------------------------------------------
+        # ---------------------------------------------
 
         if (
             candidate[
@@ -6715,15 +6624,14 @@ def adapt_process_choose(
             )
 
 
-        # -------------------------------------------------
-        # Total cost
-        # -------------------------------------------------
+        # ---------------------------------------------
+        # Cost
+        # ---------------------------------------------
 
         if (
             total_costs[
                 name
-            ]
-            is not None
+            ] is not None
 
             and total_costs[
                 name
@@ -6740,10 +6648,7 @@ def adapt_process_choose(
             )
 
 
-    # -----------------------------------------------------
-    # Sort and deduplicate each code array.
-    # -----------------------------------------------------
-
+    # Sort codes.
     for name in ADAPT_PRIORITY:
 
         reason_codes[
@@ -6755,29 +6660,21 @@ def adapt_process_choose(
         )
 
 
-    # -----------------------------------------------------
-    # Eligible interventions stay in PUBLISHED priority.
-    # -----------------------------------------------------
-
+    # Eligible remains in published priority order.
     eligible = []
 
 
-    # A malformed overall contract cannot select anything.
-    overall_valid = (
+    if (
         policy_valid
         and candidate_contract_valid
-    )
-
-
-    if overall_valid:
+    ):
 
         for name in ADAPT_PRIORITY:
 
             if (
                 reason_codes[
                     name
-                ]
-                == []
+                ] == []
             ):
 
                 eligible.append(
@@ -6831,22 +6728,16 @@ def adapt_process_choose(
 # REPAIR HELPERS
 # =========================================================
 
-def adapt_validate_string_id_list(
-    value
-):
+def adapt_validate_string_id_list(value):
     """
     Require:
-    - list
-    - non-empty
-    - all strings
-    - all unique
+    - non-empty list
+    - non-empty UTF-8 strings
+    - unique strings
     """
 
     if (
-        not isinstance(
-            value,
-            list
-        )
+        not isinstance(value, list)
         or len(value) == 0
     ):
 
@@ -6858,8 +6749,7 @@ def adapt_validate_string_id_list(
 
     for item in value:
 
-
-        if not adapt_is_utf8_string(
+        if not adapt_is_nonempty_utf8_string(
             item
         ):
 
@@ -6871,38 +6761,38 @@ def adapt_validate_string_id_list(
             return False
 
 
-        seen.add(
-            item
-        )
+        seen.add(item)
 
 
     return True
 
 
-def adapt_is_full_model_file(
-    filename
-):
+def adapt_is_full_model_file(filename):
     """
     Detect common full-model weight artifacts.
 
-    These must never be emitted by a PEFT adapter-only run.
+    adapter_model.safetensors is explicitly allowed.
     """
 
     if not isinstance(
         filename,
         str
     ):
-
         return False
 
 
-    # Only inspect final path component.
     base = filename.replace(
         "\\",
         "/"
     ).split("/")[-1]
 
 
+    # Exact allowed adapter model is NOT full model.
+    if base == "adapter_model.safetensors":
+        return False
+
+
+    # Common complete-model files.
     if base in {
         "pytorch_model.bin",
         "model.safetensors",
@@ -6913,8 +6803,7 @@ def adapt_is_full_model_file(
         return True
 
 
-    # Sharded PyTorch model:
-    # pytorch_model-00001-of-00002.bin
+    # Sharded pytorch weights.
     if (
         base.startswith(
             "pytorch_model-"
@@ -6927,8 +6816,7 @@ def adapt_is_full_model_file(
         return True
 
 
-    # Sharded safetensors full model:
-    # model-00001-of-00002.safetensors
+    # Sharded full safetensors.
     if (
         base.startswith(
             "model-"
@@ -6944,37 +6832,22 @@ def adapt_is_full_model_file(
     return False
 
 
-def adapt_validate_resume_array(
-    value
-):
-    """
-    Resume weight arrays must:
-    - be lists
-    - be non-empty
-    - contain finite numbers only
-    """
+def adapt_validate_resume_array(value):
 
     if (
-        not isinstance(
-            value,
-            list
-        )
+        not isinstance(value, list)
         or len(value) == 0
     ):
 
         return False
 
 
-    for item in value:
-
-        if not adapt_is_finite_number(
+    return all(
+        adapt_is_finite_number(
             item
-        ):
-
-            return False
-
-
-    return True
+        )
+        for item in value
+    )
 
 
 # =========================================================
@@ -6990,7 +6863,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 1. TOKEN LABEL MASK
+    # 1. TOKENS / LOSS LABELS
     # =====================================================
 
     tokens = body.get(
@@ -6999,10 +6872,7 @@ def adapt_process_repair(
 
 
     tokens_valid = (
-        isinstance(
-            tokens,
-            list
-        )
+        isinstance(tokens, list)
         and len(tokens) > 0
     )
 
@@ -7011,87 +6881,59 @@ def adapt_process_repair(
 
         for token in tokens:
 
-
             if not isinstance(
                 token,
                 dict
             ):
 
                 tokens_valid = False
-
                 break
-
-
-            token_id = token.get(
-                "id"
-            )
-
-            role = token.get(
-                "role"
-            )
-
-            padding = token.get(
-                "padding"
-            )
-
-            text = token.get(
-                "text"
-            )
 
 
             if not adapt_is_safe_nonnegative_int(
-                token_id
+                token.get("id")
             ):
 
                 tokens_valid = False
-
                 break
 
 
-            if role not in (
+            if token.get(
+                "role"
+            ) not in (
                 "system",
                 "user",
                 "assistant",
             ):
 
                 tokens_valid = False
-
                 break
 
 
             if not isinstance(
-                padding,
+                token.get("padding"),
                 bool
             ):
 
                 tokens_valid = False
-
                 break
 
 
             if not isinstance(
-                text,
+                token.get("text"),
                 str
             ):
 
                 tokens_valid = False
-
                 break
 
-
-    # -----------------------------------------------------
-    # Labels
-    # -----------------------------------------------------
 
     labels = []
 
 
-    if isinstance(
-        tokens,
-        list
-    ):
+    if isinstance(tokens, list):
 
-        # If ANY token is invalid, ALL labels are -100.
+        # Any invalid token => ALL labels = -100.
         if not tokens_valid:
 
             labels = [
@@ -7104,17 +6946,14 @@ def adapt_process_repair(
 
             for token in tokens:
 
-
                 if (
                     token[
                         "role"
-                    ]
-                    == "assistant"
+                    ] == "assistant"
 
                     and token[
                         "padding"
-                    ]
-                    is False
+                    ] is False
                 ):
 
                     labels.append(
@@ -7122,7 +6961,6 @@ def adapt_process_repair(
                             "id"
                         ]
                     )
-
 
                 else:
 
@@ -7139,7 +6977,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 2. CHAT TEMPLATE COUNT
+    # 2. CHAT TEMPLATE
     # =====================================================
 
     template_applications = (
@@ -7161,8 +6999,7 @@ def adapt_process_repair(
             bool
         )
 
-        and template_applications
-        == 1
+        and template_applications == 1
     )
 
 
@@ -7174,12 +7011,8 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 3. LoRA / PEFT PARAMETERS
+    # 3. ALLOWED LoRA TARGETS
     # =====================================================
-
-    parameters = body.get(
-        "parameters"
-    )
 
     allowed_targets = body.get(
         "allowedTargets"
@@ -7187,7 +7020,40 @@ def adapt_process_repair(
 
 
     # -----------------------------------------------------
-    # Validate allowedTargets
+    # Build usable target values independently.
+    #
+    # Even if the array contains duplicates, we can still
+    # identify which target strings were supplied.
+    # The CONFIG will fail, but trainable parameters can
+    # still be deterministically reported.
+    # -----------------------------------------------------
+
+    usable_allowed_targets = set()
+
+
+    if isinstance(
+        allowed_targets,
+        list
+    ):
+
+        for target in allowed_targets:
+
+            if adapt_is_nonempty_utf8_string(
+                target
+            ):
+
+                usable_allowed_targets.add(
+                    target
+                )
+
+
+    # -----------------------------------------------------
+    # Strict contract for allowedTargets:
+    #
+    # - list
+    # - non-empty
+    # - every entry non-empty string
+    # - unique
     # -----------------------------------------------------
 
     allowed_targets_valid = (
@@ -7202,7 +7068,7 @@ def adapt_process_repair(
         ) > 0
 
         and all(
-            adapt_is_utf8_string(
+            adapt_is_nonempty_utf8_string(
                 target
             )
             for target
@@ -7220,43 +7086,106 @@ def adapt_process_repair(
     )
 
 
-    allowed_target_set = (
-        set(
-            allowed_targets
+    # =====================================================
+    # 4. PARAMETERS
+    # =====================================================
+
+    parameters = body.get(
+        "parameters"
+    )
+
+
+    parameters_container_valid = (
+        isinstance(
+            parameters,
+            list
         )
-        if allowed_targets_valid
-        else set()
+    )
+
+
+    parameter_contract_valid = (
+        parameters_container_valid
     )
 
 
     # -----------------------------------------------------
-    # Validate parameters
+    # First pass:
+    # find duplicate valid string parameter names.
     # -----------------------------------------------------
 
-    parameters_valid = isinstance(
-        parameters,
-        list
-    )
+    parameter_name_counts = {}
 
 
-    seen_parameter_names = set()
-
-    valid_parameter_records = []
-
-
-    if parameters_valid:
-
+    if parameters_container_valid:
 
         for parameter in parameters:
-
 
             if not isinstance(
                 parameter,
                 dict
             ):
+                continue
 
-                parameters_valid = False
 
+            name = parameter.get(
+                "name"
+            )
+
+
+            if adapt_is_nonempty_utf8_string(
+                name
+            ):
+
+                parameter_name_counts[
+                    name
+                ] = (
+                    parameter_name_counts.get(
+                        name,
+                        0
+                    )
+                    + 1
+                )
+
+
+    duplicate_parameter_names = {
+
+        name
+
+        for (
+            name,
+            count
+        ) in parameter_name_counts.items()
+
+        if count > 1
+    }
+
+
+    # -----------------------------------------------------
+    # Second pass:
+    # validate each parameter independently.
+    #
+    # IMPORTANT FIX:
+    #
+    # One malformed parameter does NOT erase all otherwise
+    # valid LoRA parameters from trainableParams.
+    # -----------------------------------------------------
+
+    individually_valid_parameters = []
+
+
+    if parameters_container_valid:
+
+        for parameter in parameters:
+
+            parameter_ok = isinstance(
+                parameter,
+                dict
+            )
+
+
+            if not parameter_ok:
+
+                parameter_contract_valid = False
                 continue
 
 
@@ -7273,35 +7202,29 @@ def adapt_process_repair(
             )
 
 
-            parameter_ok = True
-
-
-            if not adapt_is_utf8_string(
+            # Name must be non-empty string.
+            if not adapt_is_nonempty_utf8_string(
                 name
             ):
 
                 parameter_ok = False
 
 
-            elif name in seen_parameter_names:
+            # Duplicate names invalidate EVERY occurrence.
+            elif name in duplicate_parameter_names:
 
                 parameter_ok = False
 
 
-            else:
-
-                seen_parameter_names.add(
-                    name
-                )
-
-
-            if not adapt_is_utf8_string(
+            # Target must be a non-empty string.
+            if not adapt_is_nonempty_utf8_string(
                 target
             ):
 
                 parameter_ok = False
 
 
+            # numel must be POSITIVE safe integer.
             if not adapt_is_safe_positive_int(
                 numel
             ):
@@ -7311,7 +7234,7 @@ def adapt_process_repair(
 
             if parameter_ok:
 
-                valid_parameter_records.append(
+                individually_valid_parameters.append(
                     {
                         "name":
                             name,
@@ -7324,61 +7247,71 @@ def adapt_process_repair(
                     }
                 )
 
-
             else:
 
-                parameters_valid = False
+                parameter_contract_valid = False
+
+
+    # Empty / non-list parameter input cannot satisfy PEFT.
+    if (
+        not parameters_container_valid
+        or len(parameters) == 0
+    ):
+
+        parameter_contract_valid = False
 
 
     # -----------------------------------------------------
-    # Select ONLY allowed LoRA matrices.
+    # Select ONLY valid LoRA matrices whose target was
+    # supplied in allowedTargets.
+    #
+    # We use usable_allowed_targets here even when the
+    # allowedTargets array itself has a duplicate.
+    #
+    # That lets diagnostics still report deterministic
+    # trainableParams while peftConfigPass remains false.
     # -----------------------------------------------------
 
     trainable_records = []
 
 
-    if (
-        parameters_valid
-        and allowed_targets_valid
+    for parameter in (
+        individually_valid_parameters
     ):
 
-        for parameter in (
-            valid_parameter_records
+        name = parameter[
+            "name"
+        ]
+
+        target = parameter[
+            "target"
+        ]
+
+
+        lora_suffix = (
+
+            name.endswith(
+                ".lora_A.weight"
+            )
+
+            or name.endswith(
+                ".lora_B.weight"
+            )
+        )
+
+
+        if (
+            lora_suffix
+            and target
+            in usable_allowed_targets
         ):
 
-
-            name = parameter[
-                "name"
-            ]
-
-            target = parameter[
-                "target"
-            ]
-
-
-            suffix_ok = (
-                name.endswith(
-                    ".lora_A.weight"
-                )
-                or name.endswith(
-                    ".lora_B.weight"
-                )
+            trainable_records.append(
+                parameter
             )
 
 
-            if (
-                target
-                in allowed_target_set
-
-                and suffix_ok
-            ):
-
-                trainable_records.append(
-                    parameter
-                )
-
-
-    # Sort trainable names by UTF-8 bytes.
+    # Required UTF-8 ordering.
     trainable_records = sorted(
 
         trainable_records,
@@ -7393,12 +7326,21 @@ def adapt_process_repair(
 
 
     trainable_params = [
+
         item[
             "name"
         ]
+
         for item
         in trainable_records
     ]
+
+
+    has_trainable_lora = (
+        len(
+            trainable_records
+        ) > 0
+    )
 
 
     # -----------------------------------------------------
@@ -7412,8 +7354,7 @@ def adapt_process_repair(
 
     for item in trainable_records:
 
-
-        next_count = (
+        next_total = (
             trainable_count
             + item[
                 "numel"
@@ -7421,45 +7362,31 @@ def adapt_process_repair(
         )
 
 
-        if (
-            next_count
-            > SAFE_INTEGER_MAX
-        ):
+        if next_total > SAFE_INTEGER_MAX:
 
             trainable_sum_safe = False
-
             break
 
 
         trainable_count = (
-            next_count
+            next_total
         )
 
 
+    # Never return an unsafe integer.
     if not trainable_sum_safe:
 
         trainable_count = 0
 
 
-    # Must have at least one trainable LoRA parameter.
-    has_trainable_lora = (
-        len(
-            trainable_records
-        ) > 0
-    )
-
-
     # =====================================================
-    # 4. INFERENCE MODE
+    # 5. INFERENCE MODE
     # =====================================================
-
-    inference_mode = body.get(
-        "inferenceMode"
-    )
-
 
     inference_mode_pass = (
-        inference_mode is False
+        body.get(
+            "inferenceMode"
+        ) is False
     )
 
 
@@ -7470,13 +7397,13 @@ def adapt_process_repair(
         )
 
 
-    # -----------------------------------------------------
-    # Overall PEFT configuration pass
-    # -----------------------------------------------------
+    # =====================================================
+    # 6. PEFT CONFIG PASS
+    # =====================================================
 
     peft_config_pass = (
 
-        parameters_valid
+        parameter_contract_valid
 
         and allowed_targets_valid
 
@@ -7488,8 +7415,9 @@ def adapt_process_repair(
     )
 
 
+    # Any PEFT parameter/target/count problem.
     if not (
-        parameters_valid
+        parameter_contract_valid
 
         and allowed_targets_valid
 
@@ -7504,7 +7432,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 5. TRAIN / EVAL ISOLATION
+    # 7. TRAIN / EVAL ISOLATION
     # =====================================================
 
     train_row_ids = body.get(
@@ -7556,16 +7484,13 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 6. EVALUATION DROPOUT
+    # 8. EVALUATION DROPOUT
     # =====================================================
 
-    dropout_active = body.get(
-        "dropoutActiveDuringEval"
-    )
-
-
     evaluation_deterministic = (
-        dropout_active is False
+        body.get(
+            "dropoutActiveDuringEval"
+        ) is False
     )
 
 
@@ -7577,7 +7502,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 7. ADAPTER ARTIFACT FILES
+    # 9. ARTIFACT FILES
     # =====================================================
 
     artifact_files = body.get(
@@ -7593,7 +7518,7 @@ def adapt_process_repair(
         )
 
         and all(
-            adapt_is_utf8_string(
+            adapt_is_nonempty_utf8_string(
                 filename
             )
             for filename
@@ -7603,34 +7528,46 @@ def adapt_process_repair(
 
 
     # -----------------------------------------------------
-    # Return adapter files that actually appear,
-    # as a set sorted by UTF-8 bytes.
+    # IMPORTANT FIX:
+    #
+    # Return the supplied artifact list in deterministic
+    # UTF-8 order.
+    #
+    # Do NOT silently filter bad/extra/duplicate files out
+    # of the response.
     # -----------------------------------------------------
-
-    adapter_files = []
-
 
     if artifact_list_valid:
 
         adapter_files = sorted(
-
-            {
-                filename
-                for filename
-                in artifact_files
-                if filename
-                in ADAPT_REQUIRED_FILES
-            },
-
+            artifact_files,
             key=lambda value:
                 value.encode(
                     "utf-8"
                 )
         )
 
+    else:
+
+        adapter_files = []
+
+
+    required_sorted = sorted(
+        ADAPT_REQUIRED_FILES,
+        key=lambda value:
+            value.encode(
+                "utf-8"
+            )
+    )
+
 
     # -----------------------------------------------------
-    # Exact required set, each exactly once.
+    # Exact adapter file contract:
+    #
+    # adapter_config.json
+    # adapter_model.safetensors
+    #
+    # exactly once each and NOTHING else.
     # -----------------------------------------------------
 
     adapter_file_set_pass = (
@@ -7641,20 +7578,8 @@ def adapt_process_repair(
             artifact_files
         ) == 2
 
-        and sorted(
-            artifact_files,
-            key=lambda value:
-                value.encode(
-                    "utf-8"
-                )
-        )
-        == sorted(
-            ADAPT_REQUIRED_FILES,
-            key=lambda value:
-                value.encode(
-                    "utf-8"
-                )
-        )
+        and adapter_files
+        == required_sorted
     )
 
 
@@ -7666,7 +7591,7 @@ def adapt_process_repair(
 
 
     # -----------------------------------------------------
-    # Detect forbidden full-model weights.
+    # Full model artifact detection
     # -----------------------------------------------------
 
     full_model_artifact = False
@@ -7675,9 +7600,11 @@ def adapt_process_repair(
     if artifact_list_valid:
 
         full_model_artifact = any(
+
             adapt_is_full_model_file(
                 filename
             )
+
             for filename
             in artifact_files
         )
@@ -7691,7 +7618,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 8. CHECKPOINT COMPLETENESS
+    # 10. CHECKPOINT
     # =====================================================
 
     checkpoint = body.get(
@@ -7722,7 +7649,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 9. BASE REVISION
+    # 11. BASE REVISION
     # =====================================================
 
     base_revision = body.get(
@@ -7752,7 +7679,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 10. IMMUTABLE LINEAGE DIGESTS
+    # 12. DATASET / CODE / CONFIG DIGEST LINEAGE
     # =====================================================
 
     dataset_digest = body.get(
@@ -7771,10 +7698,6 @@ def adapt_process_repair(
         "expectedDigests"
     )
 
-
-    # -----------------------------------------------------
-    # Actual digest syntax
-    # -----------------------------------------------------
 
     dataset_digest_valid = (
 
@@ -7818,10 +7741,6 @@ def adapt_process_repair(
     )
 
 
-    # -----------------------------------------------------
-    # Expected digests must exist and match.
-    # -----------------------------------------------------
-
     expected_valid = isinstance(
         expected_digests,
         dict
@@ -7833,11 +7752,8 @@ def adapt_process_repair(
 
     if (
         expected_valid
-
         and dataset_digest_valid
-
         and code_digest_valid
-
         and config_digest_valid
     ):
 
@@ -7867,8 +7783,6 @@ def adapt_process_repair(
         )
 
 
-    # Lineage requires BOTH:
-    # immutable base revision + matching digests.
     lineage_pass = (
 
         base_revision_pass
@@ -7877,7 +7791,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 11. EFFECTIVE BATCH
+    # 13. EFFECTIVE BATCH
     # =====================================================
 
     micro_batch = body.get(
@@ -7900,9 +7814,11 @@ def adapt_process_repair(
 
 
     batch_fields_valid = all(
+
         adapt_is_safe_positive_int(
             value
         )
+
         for value in [
             micro_batch,
             gradient_accumulation,
@@ -7917,12 +7833,12 @@ def adapt_process_repair(
 
     if batch_fields_valid:
 
-        # Python integers do not overflow, so calculate
-        # first and verify the resulting value is still
-        # within the safe-integer domain.
         calculated_batch = (
+
             micro_batch
+
             * gradient_accumulation
+
             * replicas
         )
 
@@ -7945,7 +7861,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 12. EXACT RESUME VALIDATION
+    # 14. RESUME EQUIVALENCE
     # =====================================================
 
     uninterrupted_weights = (
@@ -7989,11 +7905,8 @@ def adapt_process_repair(
 
     if (
         uninterrupted_valid
-
         and resumed_valid
-
         and tolerance_valid
-
         and len(
             uninterrupted_weights
         )
@@ -8033,7 +7946,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 13. SORT + DEDUPE REASON CODES
+    # 15. SORT REASON CODES
     # =====================================================
 
     reason_codes = adapt_sort_codes(
@@ -8042,7 +7955,7 @@ def adapt_process_repair(
 
 
     # =====================================================
-    # 14. EXACT REPAIR RESPONSE
+    # 16. EXACT RESPONSE
     # =====================================================
 
     response = {
@@ -8099,8 +8012,25 @@ def adapt_process_repair(
             "allowedTargetsValid":
                 allowed_targets_valid,
 
-            "parametersValid":
-                parameters_valid,
+            "usableAllowedTargets":
+                sorted(
+                    usable_allowed_targets,
+                    key=lambda value:
+                        value.encode("utf-8")
+                ),
+
+            "parameterContractValid":
+                parameter_contract_valid,
+
+            "duplicateParameterNames":
+                sorted(
+                    duplicate_parameter_names,
+                    key=lambda value:
+                        value.encode("utf-8")
+                ),
+
+            "individuallyValidParameters":
+                individually_valid_parameters,
 
             "hasTrainableLora":
                 has_trainable_lora,
@@ -8140,7 +8070,6 @@ def adapt_process_repair(
 async def adapt_endpoint(
     request: Request
 ):
-
 
     request_id = (
         uuid.uuid4().hex[:8]
@@ -8217,7 +8146,7 @@ async def adapt_endpoint(
 
 
     # -----------------------------------------------------
-    # Parsed request audit
+    # Audit parsed input
     # -----------------------------------------------------
 
     audit(
@@ -8226,10 +8155,6 @@ async def adapt_endpoint(
         body
     )
 
-
-    # -----------------------------------------------------
-    # Body must be JSON object.
-    # -----------------------------------------------------
 
     if not isinstance(
         body,
@@ -8245,19 +8170,12 @@ async def adapt_endpoint(
         )
 
 
-    # -----------------------------------------------------
-    # Operation routing
-    # -----------------------------------------------------
-
     operation = body.get(
         "operation"
     )
 
 
-    # Explicit requirement:
-    # unknown/missing operation -> HTTP 400 exactly
-    #
-    # {"error":"INVALID_INPUT"}
+    # Missing/unknown operation.
     if operation not in (
         "choose",
         "repair",
@@ -8283,10 +8201,6 @@ async def adapt_endpoint(
         )
 
 
-    # -----------------------------------------------------
-    # CHOOSE
-    # -----------------------------------------------------
-
     if operation == "choose":
 
         return adapt_process_choose(
@@ -8294,10 +8208,6 @@ async def adapt_endpoint(
             request_id
         )
 
-
-    # -----------------------------------------------------
-    # REPAIR
-    # -----------------------------------------------------
 
     return adapt_process_repair(
         body,
