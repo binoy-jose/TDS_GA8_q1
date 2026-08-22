@@ -3289,7 +3289,7 @@ def bqml_process_evaluate(
     # BYTE_LIMIT
     # -----------------------------------------------------
 
-    critical_slice_pass = True
+    critical_slice_pass = can_score
 
 
     if (
