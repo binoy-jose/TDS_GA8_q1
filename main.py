@@ -12773,13 +12773,7 @@ def pipeline_build_nodes(state):
                     )
 
 
-                triggering_ids = (
-                    list(
-                        previous_result[
-                            "triggeringEventIds"
-                        ]
-                    )
-                )
+                triggering_ids = []
 
 
             else:
@@ -13355,31 +13349,91 @@ async def pipeline_endpoint(
         # =================================================
         # Older request revision
         #
-        # Do not roll the session backward.
+        # The controller must never roll state backward.
+        
+        # Treat the request as stale readback:
+        # - keep the current revision
+        # - keep the current inputs
+        # - keep cache/state unchanged
+        # - well-formed stale events are ignored
         # =================================================
 
         else:
 
-            audit(
-                request_id,
-                "PIPELINE_REVISION_CONFLICT",
-                {
-                    "currentRevision":
-                        current_revision,
+            ignored_event_ids = []
 
-                    "suppliedRevision":
-                        revision,
+            for event in events:
+
+                if not pipeline_event_shape_valid(
+                    event
+                 ):
+
+                    audit(
+                        request_id,
+                        "PIPELINE_STALE_INVALID_EVENT",
+                        {
+                            "suppliedRevision":
+                                revision,
+
+                            "currentRevision":
+                                current_revision,
+                            }
+                    )
+
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error":
+                                "REVISION_CONFLICT"
                 }
             )
 
+                # Stale events do NOT consume their IDs.
+                ignored_event_ids.append(
+                    event[
+                    "eventId"
+                    ]
+                    )
 
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error":
-                        "REVISION_CONFLICT"
-                }
+        nodes = pipeline_build_nodes(
+            working_state
             )
+
+        response = {
+
+        # IMPORTANT:
+        # Return the durable/current revision,
+        # not the stale supplied revision.
+            "revision":
+                current_revision,
+
+            "acceptedEventIds":
+                [],
+
+            "ignoredEventIds":
+                ignored_event_ids,
+
+            "nodes":
+                nodes,
+      }
+
+        audit(
+            request_id,
+            "PIPELINE_STALE_READBACK",
+        {
+                "suppliedRevision":
+                    revision,
+
+                "currentRevision":
+                    current_revision,
+
+                "response":
+                    response,
+        }
+    )
+
+
+    return response
 
 
     # =====================================================
