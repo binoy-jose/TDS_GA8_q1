@@ -5952,3 +5952,2354 @@ async def promote_endpoint(
     return response_payload
 
 
+# =========================================================
+# WEEK 8 - Q4
+# Choose the Minimal Adaptation and Repair a PEFT Run
+# Endpoint: POST /adapt
+# =========================================================
+
+
+# ---------------------------------------------------------
+# PUBLISHED INTERVENTION PRIORITY
+# ---------------------------------------------------------
+
+ADAPT_PRIORITY = [
+    "prompt_only",
+    "retrieval",
+    "lora",
+    "qlora",
+]
+
+
+# ---------------------------------------------------------
+# LINEAGE REGEXES
+# ---------------------------------------------------------
+
+ADAPT_BASE_REVISION_RE = re.compile(
+    r"^[0-9a-f]{40}$"
+)
+
+ADAPT_DIGEST_RE = re.compile(
+    r"^[0-9a-f]{64}$"
+)
+
+
+# ---------------------------------------------------------
+# REQUIRED ADAPTER FILES
+# ---------------------------------------------------------
+
+ADAPT_REQUIRED_FILES = [
+    "adapter_config.json",
+    "adapter_model.safetensors",
+]
+
+
+# ---------------------------------------------------------
+# CHECKPOINT KEYS
+# ---------------------------------------------------------
+
+ADAPT_CHECKPOINT_KEYS = {
+    "model",
+    "optimizer",
+    "scheduler",
+    "step",
+    "rng",
+    "dataPosition",
+}
+
+
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
+
+def adapt_is_number(value):
+    """
+    Numeric value, excluding Boolean.
+    """
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    )
+
+
+def adapt_is_finite_number(value):
+    """
+    Finite numeric value.
+    """
+
+    return (
+        adapt_is_number(value)
+        and math.isfinite(float(value))
+    )
+
+
+def adapt_is_nonnegative_finite(value):
+    """
+    Finite number >= 0.
+    """
+
+    return (
+        adapt_is_finite_number(value)
+        and float(value) >= 0.0
+    )
+
+
+def adapt_is_safe_nonnegative_int(value):
+    """
+    Non-negative JavaScript-safe integer.
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= SAFE_INTEGER_MAX
+    )
+
+
+def adapt_is_safe_positive_int(value):
+    """
+    Positive JavaScript-safe integer.
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= SAFE_INTEGER_MAX
+    )
+
+
+def adapt_is_utf8_string(value):
+    """
+    Valid UTF-8 encodable Python string.
+    """
+
+    if not isinstance(value, str):
+        return False
+
+    try:
+
+        value.encode("utf-8")
+
+        return True
+
+    except UnicodeEncodeError:
+
+        return False
+
+
+def adapt_sort_codes(codes):
+    """
+    Sort + deduplicate codes by UTF-8 bytes.
+    """
+
+    return sorted(
+        set(codes),
+        key=lambda value:
+            value.encode("utf-8")
+    )
+
+
+# =========================================================
+# CHOOSE OPERATION
+# =========================================================
+
+def adapt_validate_choose_policy(policy):
+    """
+    Validate the complete intervention policy.
+
+    Returns:
+        (True, normalized_policy)
+
+    or:
+        (False, None)
+    """
+
+    if not isinstance(policy, dict):
+
+        return False, None
+
+
+    min_quality = policy.get(
+        "minQuality"
+    )
+
+    freshness_required = policy.get(
+        "freshnessRequired"
+    )
+
+    max_latency = policy.get(
+        "maxLatencyMs"
+    )
+
+    max_memory = policy.get(
+        "maxMemoryMb"
+    )
+
+    max_labeled = policy.get(
+        "maxLabeledExamples"
+    )
+
+    max_total_cost = policy.get(
+        "maxTotalCost"
+    )
+
+    horizon = policy.get(
+        "horizonRequests"
+    )
+
+
+    # Quality floor must be finite [0,1].
+    if (
+        not adapt_is_finite_number(
+            min_quality
+        )
+        or not (
+            0.0
+            <= float(min_quality)
+            <= 1.0
+        )
+    ):
+
+        return False, None
+
+
+    # Freshness requirement must really be Boolean.
+    if not isinstance(
+        freshness_required,
+        bool
+    ):
+
+        return False, None
+
+
+    # Latency ceiling.
+    if not adapt_is_nonnegative_finite(
+        max_latency
+    ):
+
+        return False, None
+
+
+    # Memory ceiling.
+    if not adapt_is_nonnegative_finite(
+        max_memory
+    ):
+
+        return False, None
+
+
+    # Labeled examples ceiling.
+    if not adapt_is_safe_nonnegative_int(
+        max_labeled
+    ):
+
+        return False, None
+
+
+    # Total cost ceiling.
+    if not adapt_is_nonnegative_finite(
+        max_total_cost
+    ):
+
+        return False, None
+
+
+    # Horizon request count.
+    if not adapt_is_safe_nonnegative_int(
+        horizon
+    ):
+
+        return False, None
+
+
+    normalized = {
+
+        "minQuality":
+            float(min_quality),
+
+        "freshnessRequired":
+            freshness_required,
+
+        "maxLatencyMs":
+            float(max_latency),
+
+        "maxMemoryMb":
+            float(max_memory),
+
+        "maxLabeledExamples":
+            max_labeled,
+
+        "maxTotalCost":
+            float(max_total_cost),
+
+        "horizonRequests":
+            horizon,
+    }
+
+
+    return True, normalized
+
+
+def adapt_candidate_structure_valid(
+    candidate
+):
+    """
+    Validate a candidate's field TYPES/RANGES.
+
+    Gate failures such as low quality are NOT structural
+    failures. Those are checked separately.
+    """
+
+    if not isinstance(
+        candidate,
+        dict
+    ):
+
+        return False
+
+
+    name = candidate.get(
+        "name"
+    )
+
+    available = candidate.get(
+        "available"
+    )
+
+    quality = candidate.get(
+        "quality"
+    )
+
+    freshness = candidate.get(
+        "freshness"
+    )
+
+    latency = candidate.get(
+        "latencyMs"
+    )
+
+    memory = candidate.get(
+        "memoryMb"
+    )
+
+    labeled = candidate.get(
+        "labeledExamples"
+    )
+
+    one_time = candidate.get(
+        "oneTimeCost"
+    )
+
+    recurring = candidate.get(
+        "recurringCost"
+    )
+
+
+    if name not in ADAPT_PRIORITY:
+
+        return False
+
+
+    if not isinstance(
+        available,
+        bool
+    ):
+
+        return False
+
+
+    if (
+        not adapt_is_finite_number(
+            quality
+        )
+        or not (
+            0.0
+            <= float(quality)
+            <= 1.0
+        )
+    ):
+
+        return False
+
+
+    if not isinstance(
+        freshness,
+        bool
+    ):
+
+        return False
+
+
+    if not adapt_is_nonnegative_finite(
+        latency
+    ):
+
+        return False
+
+
+    if not adapt_is_nonnegative_finite(
+        memory
+    ):
+
+        return False
+
+
+    if not adapt_is_safe_nonnegative_int(
+        labeled
+    ):
+
+        return False
+
+
+    if not adapt_is_nonnegative_finite(
+        one_time
+    ):
+
+        return False
+
+
+    if not adapt_is_nonnegative_finite(
+        recurring
+    ):
+
+        return False
+
+
+    return True
+
+
+def adapt_process_choose(
+    body,
+    request_id
+):
+
+    policy_valid, policy = (
+        adapt_validate_choose_policy(
+            body.get(
+                "policy"
+            )
+        )
+    )
+
+
+    candidates = body.get(
+        "candidates"
+    )
+
+
+    # -----------------------------------------------------
+    # Initialize exact required output dictionaries.
+    # -----------------------------------------------------
+
+    total_costs = {
+        name: None
+        for name in ADAPT_PRIORITY
+    }
+
+
+    reason_codes = {
+        name: []
+        for name in ADAPT_PRIORITY
+    }
+
+
+    # -----------------------------------------------------
+    # Validate the candidates container.
+    # -----------------------------------------------------
+
+    candidate_contract_valid = (
+        isinstance(
+            candidates,
+            list
+        )
+    )
+
+
+    candidate_map = {}
+
+
+    if candidate_contract_valid:
+
+
+        # Exactly FOUR candidates are required.
+        if len(candidates) != 4:
+
+            candidate_contract_valid = False
+
+
+        else:
+
+            for candidate in candidates:
+
+
+                if not isinstance(
+                    candidate,
+                    dict
+                ):
+
+                    candidate_contract_valid = False
+
+                    continue
+
+
+                name = candidate.get(
+                    "name"
+                )
+
+
+                # Name must be one of the four known names.
+                if name not in ADAPT_PRIORITY:
+
+                    candidate_contract_valid = False
+
+                    continue
+
+
+                # Exactly one candidate per intervention.
+                if name in candidate_map:
+
+                    candidate_contract_valid = False
+
+                    continue
+
+
+                candidate_map[
+                    name
+                ] = candidate
+
+
+            # All four must be present.
+            if set(
+                candidate_map.keys()
+            ) != set(
+                ADAPT_PRIORITY
+            ):
+
+                candidate_contract_valid = False
+
+
+    # -----------------------------------------------------
+    # Global malformed choose request.
+    #
+    # INVALID_INPUT applies to all four output names.
+    # -----------------------------------------------------
+
+    if (
+        not policy_valid
+        or not candidate_contract_valid
+    ):
+
+        for name in ADAPT_PRIORITY:
+
+            reason_codes[
+                name
+            ].append(
+                "INVALID_INPUT"
+            )
+
+
+    # -----------------------------------------------------
+    # Evaluate each of the four named candidates.
+    # -----------------------------------------------------
+
+    for name in ADAPT_PRIORITY:
+
+
+        candidate = candidate_map.get(
+            name
+        )
+
+
+        # Missing candidate.
+        if candidate is None:
+
+            continue
+
+
+        candidate_valid = (
+            adapt_candidate_structure_valid(
+                candidate
+            )
+        )
+
+
+        if not candidate_valid:
+
+            reason_codes[
+                name
+            ].append(
+                "INVALID_INPUT"
+            )
+
+            continue
+
+
+        # -------------------------------------------------
+        # Calculate total cost when policy horizon itself
+        # is valid.
+        # -------------------------------------------------
+
+        if policy_valid:
+
+            one_time = float(
+                candidate[
+                    "oneTimeCost"
+                ]
+            )
+
+            recurring = float(
+                candidate[
+                    "recurringCost"
+                ]
+            )
+
+
+            total = (
+                one_time
+                + (
+                    policy[
+                        "horizonRequests"
+                    ]
+                    * recurring
+                )
+            )
+
+
+            # Guard against numeric overflow.
+            if math.isfinite(total):
+
+                total = round(
+                    total,
+                    12
+                )
+
+                total_costs[
+                    name
+                ] = total
+
+
+            else:
+
+                reason_codes[
+                    name
+                ].append(
+                    "INVALID_INPUT"
+                )
+
+
+        # If policy is malformed, we cannot apply gates.
+        if not policy_valid:
+
+            continue
+
+
+        # -------------------------------------------------
+        # Availability
+        # -------------------------------------------------
+
+        if candidate[
+            "available"
+        ] is False:
+
+            reason_codes[
+                name
+            ].append(
+                "UNAVAILABLE"
+            )
+
+
+        # -------------------------------------------------
+        # Quality
+        # -------------------------------------------------
+
+        if (
+            float(
+                candidate[
+                    "quality"
+                ]
+            )
+            < policy[
+                "minQuality"
+            ]
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "QUALITY_FLOOR"
+            )
+
+
+        # -------------------------------------------------
+        # Freshness
+        # -------------------------------------------------
+
+        if (
+            policy[
+                "freshnessRequired"
+            ]
+            and candidate[
+                "freshness"
+            ] is False
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "FRESHNESS_REQUIRED"
+            )
+
+
+        # -------------------------------------------------
+        # Latency
+        # -------------------------------------------------
+
+        if (
+            float(
+                candidate[
+                    "latencyMs"
+                ]
+            )
+            > policy[
+                "maxLatencyMs"
+            ]
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "LATENCY_LIMIT"
+            )
+
+
+        # -------------------------------------------------
+        # Memory
+        # -------------------------------------------------
+
+        if (
+            float(
+                candidate[
+                    "memoryMb"
+                ]
+            )
+            > policy[
+                "maxMemoryMb"
+            ]
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "MEMORY_LIMIT"
+            )
+
+
+        # -------------------------------------------------
+        # Labeled data
+        # -------------------------------------------------
+
+        if (
+            candidate[
+                "labeledExamples"
+            ]
+            > policy[
+                "maxLabeledExamples"
+            ]
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "DATA_LIMIT"
+            )
+
+
+        # -------------------------------------------------
+        # Total cost
+        # -------------------------------------------------
+
+        if (
+            total_costs[
+                name
+            ]
+            is not None
+
+            and total_costs[
+                name
+            ]
+            > policy[
+                "maxTotalCost"
+            ]
+        ):
+
+            reason_codes[
+                name
+            ].append(
+                "COST_LIMIT"
+            )
+
+
+    # -----------------------------------------------------
+    # Sort and deduplicate each code array.
+    # -----------------------------------------------------
+
+    for name in ADAPT_PRIORITY:
+
+        reason_codes[
+            name
+        ] = adapt_sort_codes(
+            reason_codes[
+                name
+            ]
+        )
+
+
+    # -----------------------------------------------------
+    # Eligible interventions stay in PUBLISHED priority.
+    # -----------------------------------------------------
+
+    eligible = []
+
+
+    # A malformed overall contract cannot select anything.
+    overall_valid = (
+        policy_valid
+        and candidate_contract_valid
+    )
+
+
+    if overall_valid:
+
+        for name in ADAPT_PRIORITY:
+
+            if (
+                reason_codes[
+                    name
+                ]
+                == []
+            ):
+
+                eligible.append(
+                    name
+                )
+
+
+    selected = (
+        eligible[0]
+        if eligible
+        else None
+    )
+
+
+    response = {
+
+        "selected":
+            selected,
+
+        "eligible":
+            eligible,
+
+        "totalCosts":
+            total_costs,
+
+        "reasonCodes":
+            reason_codes,
+    }
+
+
+    audit(
+        request_id,
+        "ADAPT_CHOOSE_RESULT",
+        {
+            "policyValid":
+                policy_valid,
+
+            "candidateContractValid":
+                candidate_contract_valid,
+
+            "response":
+                response,
+        }
+    )
+
+
+    return response
+
+
+# =========================================================
+# REPAIR HELPERS
+# =========================================================
+
+def adapt_validate_string_id_list(
+    value
+):
+    """
+    Require:
+    - list
+    - non-empty
+    - all strings
+    - all unique
+    """
+
+    if (
+        not isinstance(
+            value,
+            list
+        )
+        or len(value) == 0
+    ):
+
+        return False
+
+
+    seen = set()
+
+
+    for item in value:
+
+
+        if not adapt_is_utf8_string(
+            item
+        ):
+
+            return False
+
+
+        if item in seen:
+
+            return False
+
+
+        seen.add(
+            item
+        )
+
+
+    return True
+
+
+def adapt_is_full_model_file(
+    filename
+):
+    """
+    Detect common full-model weight artifacts.
+
+    These must never be emitted by a PEFT adapter-only run.
+    """
+
+    if not isinstance(
+        filename,
+        str
+    ):
+
+        return False
+
+
+    # Only inspect final path component.
+    base = filename.replace(
+        "\\",
+        "/"
+    ).split("/")[-1]
+
+
+    if base in {
+        "pytorch_model.bin",
+        "model.safetensors",
+        "tf_model.h5",
+        "flax_model.msgpack",
+    }:
+
+        return True
+
+
+    # Sharded PyTorch model:
+    # pytorch_model-00001-of-00002.bin
+    if (
+        base.startswith(
+            "pytorch_model-"
+        )
+        and base.endswith(
+            ".bin"
+        )
+    ):
+
+        return True
+
+
+    # Sharded safetensors full model:
+    # model-00001-of-00002.safetensors
+    if (
+        base.startswith(
+            "model-"
+        )
+        and base.endswith(
+            ".safetensors"
+        )
+    ):
+
+        return True
+
+
+    return False
+
+
+def adapt_validate_resume_array(
+    value
+):
+    """
+    Resume weight arrays must:
+    - be lists
+    - be non-empty
+    - contain finite numbers only
+    """
+
+    if (
+        not isinstance(
+            value,
+            list
+        )
+        or len(value) == 0
+    ):
+
+        return False
+
+
+    for item in value:
+
+        if not adapt_is_finite_number(
+            item
+        ):
+
+            return False
+
+
+    return True
+
+
+# =========================================================
+# REPAIR OPERATION
+# =========================================================
+
+def adapt_process_repair(
+    body,
+    request_id
+):
+
+    reason_codes = []
+
+
+    # =====================================================
+    # 1. TOKEN LABEL MASK
+    # =====================================================
+
+    tokens = body.get(
+        "tokens"
+    )
+
+
+    tokens_valid = (
+        isinstance(
+            tokens,
+            list
+        )
+        and len(tokens) > 0
+    )
+
+
+    if tokens_valid:
+
+        for token in tokens:
+
+
+            if not isinstance(
+                token,
+                dict
+            ):
+
+                tokens_valid = False
+
+                break
+
+
+            token_id = token.get(
+                "id"
+            )
+
+            role = token.get(
+                "role"
+            )
+
+            padding = token.get(
+                "padding"
+            )
+
+            text = token.get(
+                "text"
+            )
+
+
+            if not adapt_is_safe_nonnegative_int(
+                token_id
+            ):
+
+                tokens_valid = False
+
+                break
+
+
+            if role not in (
+                "system",
+                "user",
+                "assistant",
+            ):
+
+                tokens_valid = False
+
+                break
+
+
+            if not isinstance(
+                padding,
+                bool
+            ):
+
+                tokens_valid = False
+
+                break
+
+
+            if not isinstance(
+                text,
+                str
+            ):
+
+                tokens_valid = False
+
+                break
+
+
+    # -----------------------------------------------------
+    # Labels
+    # -----------------------------------------------------
+
+    labels = []
+
+
+    if isinstance(
+        tokens,
+        list
+    ):
+
+        # If ANY token is invalid, ALL labels are -100.
+        if not tokens_valid:
+
+            labels = [
+                -100
+                for _ in tokens
+            ]
+
+
+        else:
+
+            for token in tokens:
+
+
+                if (
+                    token[
+                        "role"
+                    ]
+                    == "assistant"
+
+                    and token[
+                        "padding"
+                    ]
+                    is False
+                ):
+
+                    labels.append(
+                        token[
+                            "id"
+                        ]
+                    )
+
+
+                else:
+
+                    labels.append(
+                        -100
+                    )
+
+
+    if not tokens_valid:
+
+        reason_codes.append(
+            "INVALID_TOKEN"
+        )
+
+
+    # =====================================================
+    # 2. CHAT TEMPLATE COUNT
+    # =====================================================
+
+    template_applications = (
+        body.get(
+            "templateApplications"
+        )
+    )
+
+
+    template_pass = (
+
+        isinstance(
+            template_applications,
+            int
+        )
+
+        and not isinstance(
+            template_applications,
+            bool
+        )
+
+        and template_applications
+        == 1
+    )
+
+
+    if not template_pass:
+
+        reason_codes.append(
+            "CHAT_TEMPLATE_COUNT"
+        )
+
+
+    # =====================================================
+    # 3. LoRA / PEFT PARAMETERS
+    # =====================================================
+
+    parameters = body.get(
+        "parameters"
+    )
+
+    allowed_targets = body.get(
+        "allowedTargets"
+    )
+
+
+    # -----------------------------------------------------
+    # Validate allowedTargets
+    # -----------------------------------------------------
+
+    allowed_targets_valid = (
+
+        isinstance(
+            allowed_targets,
+            list
+        )
+
+        and len(
+            allowed_targets
+        ) > 0
+
+        and all(
+            adapt_is_utf8_string(
+                target
+            )
+            for target
+            in allowed_targets
+        )
+
+        and len(
+            set(
+                allowed_targets
+            )
+        )
+        == len(
+            allowed_targets
+        )
+    )
+
+
+    allowed_target_set = (
+        set(
+            allowed_targets
+        )
+        if allowed_targets_valid
+        else set()
+    )
+
+
+    # -----------------------------------------------------
+    # Validate parameters
+    # -----------------------------------------------------
+
+    parameters_valid = isinstance(
+        parameters,
+        list
+    )
+
+
+    seen_parameter_names = set()
+
+    valid_parameter_records = []
+
+
+    if parameters_valid:
+
+
+        for parameter in parameters:
+
+
+            if not isinstance(
+                parameter,
+                dict
+            ):
+
+                parameters_valid = False
+
+                continue
+
+
+            name = parameter.get(
+                "name"
+            )
+
+            target = parameter.get(
+                "target"
+            )
+
+            numel = parameter.get(
+                "numel"
+            )
+
+
+            parameter_ok = True
+
+
+            if not adapt_is_utf8_string(
+                name
+            ):
+
+                parameter_ok = False
+
+
+            elif name in seen_parameter_names:
+
+                parameter_ok = False
+
+
+            else:
+
+                seen_parameter_names.add(
+                    name
+                )
+
+
+            if not adapt_is_utf8_string(
+                target
+            ):
+
+                parameter_ok = False
+
+
+            if not adapt_is_safe_positive_int(
+                numel
+            ):
+
+                parameter_ok = False
+
+
+            if parameter_ok:
+
+                valid_parameter_records.append(
+                    {
+                        "name":
+                            name,
+
+                        "target":
+                            target,
+
+                        "numel":
+                            numel,
+                    }
+                )
+
+
+            else:
+
+                parameters_valid = False
+
+
+    # -----------------------------------------------------
+    # Select ONLY allowed LoRA matrices.
+    # -----------------------------------------------------
+
+    trainable_records = []
+
+
+    if (
+        parameters_valid
+        and allowed_targets_valid
+    ):
+
+        for parameter in (
+            valid_parameter_records
+        ):
+
+
+            name = parameter[
+                "name"
+            ]
+
+            target = parameter[
+                "target"
+            ]
+
+
+            suffix_ok = (
+                name.endswith(
+                    ".lora_A.weight"
+                )
+                or name.endswith(
+                    ".lora_B.weight"
+                )
+            )
+
+
+            if (
+                target
+                in allowed_target_set
+
+                and suffix_ok
+            ):
+
+                trainable_records.append(
+                    parameter
+                )
+
+
+    # Sort trainable names by UTF-8 bytes.
+    trainable_records = sorted(
+
+        trainable_records,
+
+        key=lambda item:
+            item[
+                "name"
+            ].encode(
+                "utf-8"
+            )
+    )
+
+
+    trainable_params = [
+        item[
+            "name"
+        ]
+        for item
+        in trainable_records
+    ]
+
+
+    # -----------------------------------------------------
+    # Safely sum numel.
+    # -----------------------------------------------------
+
+    trainable_count = 0
+
+    trainable_sum_safe = True
+
+
+    for item in trainable_records:
+
+
+        next_count = (
+            trainable_count
+            + item[
+                "numel"
+            ]
+        )
+
+
+        if (
+            next_count
+            > SAFE_INTEGER_MAX
+        ):
+
+            trainable_sum_safe = False
+
+            break
+
+
+        trainable_count = (
+            next_count
+        )
+
+
+    if not trainable_sum_safe:
+
+        trainable_count = 0
+
+
+    # Must have at least one trainable LoRA parameter.
+    has_trainable_lora = (
+        len(
+            trainable_records
+        ) > 0
+    )
+
+
+    # =====================================================
+    # 4. INFERENCE MODE
+    # =====================================================
+
+    inference_mode = body.get(
+        "inferenceMode"
+    )
+
+
+    inference_mode_pass = (
+        inference_mode is False
+    )
+
+
+    if not inference_mode_pass:
+
+        reason_codes.append(
+            "INFERENCE_MODE"
+        )
+
+
+    # -----------------------------------------------------
+    # Overall PEFT configuration pass
+    # -----------------------------------------------------
+
+    peft_config_pass = (
+
+        parameters_valid
+
+        and allowed_targets_valid
+
+        and has_trainable_lora
+
+        and trainable_sum_safe
+
+        and inference_mode_pass
+    )
+
+
+    if not (
+        parameters_valid
+
+        and allowed_targets_valid
+
+        and has_trainable_lora
+
+        and trainable_sum_safe
+    ):
+
+        reason_codes.append(
+            "INVALID_PARAMETER"
+        )
+
+
+    # =====================================================
+    # 5. TRAIN / EVAL ISOLATION
+    # =====================================================
+
+    train_row_ids = body.get(
+        "trainRowIds"
+    )
+
+    eval_row_ids = body.get(
+        "evalRowIds"
+    )
+
+
+    train_ids_valid = (
+        adapt_validate_string_id_list(
+            train_row_ids
+        )
+    )
+
+    eval_ids_valid = (
+        adapt_validate_string_id_list(
+            eval_row_ids
+        )
+    )
+
+
+    eval_isolated = False
+
+
+    if (
+        train_ids_valid
+        and eval_ids_valid
+    ):
+
+        eval_isolated = (
+            set(
+                train_row_ids
+            ).isdisjoint(
+                set(
+                    eval_row_ids
+                )
+            )
+        )
+
+
+    if not eval_isolated:
+
+        reason_codes.append(
+            "EVAL_LEAKAGE"
+        )
+
+
+    # =====================================================
+    # 6. EVALUATION DROPOUT
+    # =====================================================
+
+    dropout_active = body.get(
+        "dropoutActiveDuringEval"
+    )
+
+
+    evaluation_deterministic = (
+        dropout_active is False
+    )
+
+
+    if not evaluation_deterministic:
+
+        reason_codes.append(
+            "EVAL_DROPOUT_ACTIVE"
+        )
+
+
+    # =====================================================
+    # 7. ADAPTER ARTIFACT FILES
+    # =====================================================
+
+    artifact_files = body.get(
+        "artifactFiles"
+    )
+
+
+    artifact_list_valid = (
+
+        isinstance(
+            artifact_files,
+            list
+        )
+
+        and all(
+            adapt_is_utf8_string(
+                filename
+            )
+            for filename
+            in artifact_files
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # Return adapter files that actually appear,
+    # as a set sorted by UTF-8 bytes.
+    # -----------------------------------------------------
+
+    adapter_files = []
+
+
+    if artifact_list_valid:
+
+        adapter_files = sorted(
+
+            {
+                filename
+                for filename
+                in artifact_files
+                if filename
+                in ADAPT_REQUIRED_FILES
+            },
+
+            key=lambda value:
+                value.encode(
+                    "utf-8"
+                )
+        )
+
+
+    # -----------------------------------------------------
+    # Exact required set, each exactly once.
+    # -----------------------------------------------------
+
+    adapter_file_set_pass = (
+
+        artifact_list_valid
+
+        and len(
+            artifact_files
+        ) == 2
+
+        and sorted(
+            artifact_files,
+            key=lambda value:
+                value.encode(
+                    "utf-8"
+                )
+        )
+        == sorted(
+            ADAPT_REQUIRED_FILES,
+            key=lambda value:
+                value.encode(
+                    "utf-8"
+                )
+        )
+    )
+
+
+    if not adapter_file_set_pass:
+
+        reason_codes.append(
+            "ADAPTER_FILE_SET"
+        )
+
+
+    # -----------------------------------------------------
+    # Detect forbidden full-model weights.
+    # -----------------------------------------------------
+
+    full_model_artifact = False
+
+
+    if artifact_list_valid:
+
+        full_model_artifact = any(
+            adapt_is_full_model_file(
+                filename
+            )
+            for filename
+            in artifact_files
+        )
+
+
+    if full_model_artifact:
+
+        reason_codes.append(
+            "FULL_MODEL_ARTIFACT"
+        )
+
+
+    # =====================================================
+    # 8. CHECKPOINT COMPLETENESS
+    # =====================================================
+
+    checkpoint = body.get(
+        "checkpoint"
+    )
+
+
+    checkpoint_complete = (
+
+        isinstance(
+            checkpoint,
+            dict
+        )
+
+        and ADAPT_CHECKPOINT_KEYS.issubset(
+            set(
+                checkpoint.keys()
+            )
+        )
+    )
+
+
+    if not checkpoint_complete:
+
+        reason_codes.append(
+            "INCOMPLETE_CHECKPOINT"
+        )
+
+
+    # =====================================================
+    # 9. BASE REVISION
+    # =====================================================
+
+    base_revision = body.get(
+        "baseRevision"
+    )
+
+
+    base_revision_pass = (
+
+        isinstance(
+            base_revision,
+            str
+        )
+
+        and ADAPT_BASE_REVISION_RE.fullmatch(
+            base_revision
+        )
+        is not None
+    )
+
+
+    if not base_revision_pass:
+
+        reason_codes.append(
+            "MUTABLE_BASE_REVISION"
+        )
+
+
+    # =====================================================
+    # 10. IMMUTABLE LINEAGE DIGESTS
+    # =====================================================
+
+    dataset_digest = body.get(
+        "datasetDigest"
+    )
+
+    code_digest = body.get(
+        "codeDigest"
+    )
+
+    config_digest = body.get(
+        "configDigest"
+    )
+
+    expected_digests = body.get(
+        "expectedDigests"
+    )
+
+
+    # -----------------------------------------------------
+    # Actual digest syntax
+    # -----------------------------------------------------
+
+    dataset_digest_valid = (
+
+        isinstance(
+            dataset_digest,
+            str
+        )
+
+        and ADAPT_DIGEST_RE.fullmatch(
+            dataset_digest
+        )
+        is not None
+    )
+
+
+    code_digest_valid = (
+
+        isinstance(
+            code_digest,
+            str
+        )
+
+        and ADAPT_DIGEST_RE.fullmatch(
+            code_digest
+        )
+        is not None
+    )
+
+
+    config_digest_valid = (
+
+        isinstance(
+            config_digest,
+            str
+        )
+
+        and ADAPT_DIGEST_RE.fullmatch(
+            config_digest
+        )
+        is not None
+    )
+
+
+    # -----------------------------------------------------
+    # Expected digests must exist and match.
+    # -----------------------------------------------------
+
+    expected_valid = isinstance(
+        expected_digests,
+        dict
+    )
+
+
+    lineage_digests_pass = False
+
+
+    if (
+        expected_valid
+
+        and dataset_digest_valid
+
+        and code_digest_valid
+
+        and config_digest_valid
+    ):
+
+        lineage_digests_pass = (
+
+            expected_digests.get(
+                "datasetDigest"
+            )
+            == dataset_digest
+
+            and expected_digests.get(
+                "codeDigest"
+            )
+            == code_digest
+
+            and expected_digests.get(
+                "configDigest"
+            )
+            == config_digest
+        )
+
+
+    if not lineage_digests_pass:
+
+        reason_codes.append(
+            "LINEAGE_MISMATCH"
+        )
+
+
+    # Lineage requires BOTH:
+    # immutable base revision + matching digests.
+    lineage_pass = (
+
+        base_revision_pass
+        and lineage_digests_pass
+    )
+
+
+    # =====================================================
+    # 11. EFFECTIVE BATCH
+    # =====================================================
+
+    micro_batch = body.get(
+        "microBatch"
+    )
+
+    gradient_accumulation = body.get(
+        "gradientAccumulation"
+    )
+
+    replicas = body.get(
+        "replicas"
+    )
+
+    expected_effective_batch = (
+        body.get(
+            "expectedEffectiveBatch"
+        )
+    )
+
+
+    batch_fields_valid = all(
+        adapt_is_safe_positive_int(
+            value
+        )
+        for value in [
+            micro_batch,
+            gradient_accumulation,
+            replicas,
+            expected_effective_batch,
+        ]
+    )
+
+
+    effective_batch_pass = False
+
+
+    if batch_fields_valid:
+
+        # Python integers do not overflow, so calculate
+        # first and verify the resulting value is still
+        # within the safe-integer domain.
+        calculated_batch = (
+            micro_batch
+            * gradient_accumulation
+            * replicas
+        )
+
+
+        effective_batch_pass = (
+
+            calculated_batch
+            <= SAFE_INTEGER_MAX
+
+            and calculated_batch
+            == expected_effective_batch
+        )
+
+
+    if not effective_batch_pass:
+
+        reason_codes.append(
+            "EFFECTIVE_BATCH_MISMATCH"
+        )
+
+
+    # =====================================================
+    # 12. EXACT RESUME VALIDATION
+    # =====================================================
+
+    uninterrupted_weights = (
+        body.get(
+            "uninterruptedWeights"
+        )
+    )
+
+    resumed_weights = (
+        body.get(
+            "resumedWeights"
+        )
+    )
+
+    resume_tolerance = body.get(
+        "resumeTolerance"
+    )
+
+
+    uninterrupted_valid = (
+        adapt_validate_resume_array(
+            uninterrupted_weights
+        )
+    )
+
+    resumed_valid = (
+        adapt_validate_resume_array(
+            resumed_weights
+        )
+    )
+
+    tolerance_valid = (
+        adapt_is_nonnegative_finite(
+            resume_tolerance
+        )
+    )
+
+
+    resume_pass = False
+
+
+    if (
+        uninterrupted_valid
+
+        and resumed_valid
+
+        and tolerance_valid
+
+        and len(
+            uninterrupted_weights
+        )
+        == len(
+            resumed_weights
+        )
+    ):
+
+        tolerance = float(
+            resume_tolerance
+        )
+
+
+        resume_pass = all(
+
+            abs(
+                float(left)
+                - float(right)
+            )
+            <= tolerance
+
+            for (
+                left,
+                right
+            ) in zip(
+                uninterrupted_weights,
+                resumed_weights
+            )
+        )
+
+
+    if not resume_pass:
+
+        reason_codes.append(
+            "RESUME_DIVERGENCE"
+        )
+
+
+    # =====================================================
+    # 13. SORT + DEDUPE REASON CODES
+    # =====================================================
+
+    reason_codes = adapt_sort_codes(
+        reason_codes
+    )
+
+
+    # =====================================================
+    # 14. EXACT REPAIR RESPONSE
+    # =====================================================
+
+    response = {
+
+        "labels":
+            labels,
+
+        "templatePass":
+            template_pass,
+
+        "trainableParams":
+            trainable_params,
+
+        "trainableCount":
+            trainable_count,
+
+        "peftConfigPass":
+            peft_config_pass,
+
+        "adapterFiles":
+            adapter_files,
+
+        "checkpointComplete":
+            checkpoint_complete,
+
+        "lineagePass":
+            lineage_pass,
+
+        "evalIsolated":
+            eval_isolated,
+
+        "evaluationDeterministic":
+            evaluation_deterministic,
+
+        "resumePass":
+            resume_pass,
+
+        "reasonCodes":
+            reason_codes,
+    }
+
+
+    # =====================================================
+    # AUDIT
+    # =====================================================
+
+    audit(
+        request_id,
+        "ADAPT_REPAIR_RESULT",
+        {
+            "tokensValid":
+                tokens_valid,
+
+            "allowedTargetsValid":
+                allowed_targets_valid,
+
+            "parametersValid":
+                parameters_valid,
+
+            "hasTrainableLora":
+                has_trainable_lora,
+
+            "trainableSumSafe":
+                trainable_sum_safe,
+
+            "artifactFileSetPass":
+                adapter_file_set_pass,
+
+            "fullModelArtifact":
+                full_model_artifact,
+
+            "baseRevisionPass":
+                base_revision_pass,
+
+            "lineageDigestsPass":
+                lineage_digests_pass,
+
+            "effectiveBatchPass":
+                effective_batch_pass,
+
+            "response":
+                response,
+        }
+    )
+
+
+    return response
+
+
+# =========================================================
+# MAIN /adapt ENDPOINT
+# =========================================================
+
+@app.post("/adapt")
+async def adapt_endpoint(
+    request: Request
+):
+
+
+    request_id = (
+        uuid.uuid4().hex[:8]
+    )
+
+
+    # -----------------------------------------------------
+    # Strict JSON parsing
+    # -----------------------------------------------------
+
+    try:
+
+        raw_body = await request.body()
+
+
+        audit(
+            request_id,
+            "ADAPT_HTTP_REQUEST",
+            {
+                "contentType":
+                    request.headers.get(
+                        "content-type"
+                    ),
+
+                "rawBody":
+                    repr(
+                        raw_body
+                    ),
+            }
+        )
+
+
+        body_text = raw_body.decode(
+            "utf-8"
+        )
+
+
+        body = strict_json_loads(
+            body_text
+        )
+
+
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+
+
+        audit(
+            request_id,
+            "ADAPT_PARSE_FAILED",
+            {
+                "type":
+                    type(
+                        exc
+                    ).__name__,
+
+                "message":
+                    str(
+                        exc
+                    ),
+            }
+        )
+
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # Parsed request audit
+    # -----------------------------------------------------
+
+    audit(
+        request_id,
+        "ADAPT_REQUEST_PARSED",
+        body
+    )
+
+
+    # -----------------------------------------------------
+    # Body must be JSON object.
+    # -----------------------------------------------------
+
+    if not isinstance(
+        body,
+        dict
+    ):
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # Operation routing
+    # -----------------------------------------------------
+
+    operation = body.get(
+        "operation"
+    )
+
+
+    # Explicit requirement:
+    # unknown/missing operation -> HTTP 400 exactly
+    #
+    # {"error":"INVALID_INPUT"}
+    if operation not in (
+        "choose",
+        "repair",
+    ):
+
+
+        audit(
+            request_id,
+            "ADAPT_INVALID_OPERATION",
+            {
+                "operation":
+                    operation
+            }
+        )
+
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # -----------------------------------------------------
+    # CHOOSE
+    # -----------------------------------------------------
+
+    if operation == "choose":
+
+        return adapt_process_choose(
+            body,
+            request_id
+        )
+
+
+    # -----------------------------------------------------
+    # REPAIR
+    # -----------------------------------------------------
+
+    return adapt_process_repair(
+        body,
+        request_id
+    )
