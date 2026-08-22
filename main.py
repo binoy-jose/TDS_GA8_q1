@@ -11065,7 +11065,7 @@ import copy
 
 
 # =========================================================
-# FIXED PIPELINE DAG
+# FIXED DAG
 # =========================================================
 
 PIPELINE_NODES = [
@@ -11078,6 +11078,7 @@ PIPELINE_NODES = [
 ]
 
 
+# Exact event fields required by the assignment.
 PIPELINE_EVENT_FIELDS = {
     "eventId",
     "revision",
@@ -11098,7 +11099,7 @@ PIPELINE_STATUSES = {
 }
 
 
-# All required input fields.
+# Exact 12 required inputs.
 PIPELINE_REQUIRED_INPUTS = [
     "generation",
     "checksum",
@@ -11116,48 +11117,23 @@ PIPELINE_REQUIRED_INPUTS = [
 
 
 # =========================================================
-# STATE STORE
+# SESSION STATE
 # =========================================================
 #
-# State is isolated by session.
+# Completely isolated by session.
 #
-# Example:
+# Successful content-addressed cache entries survive
+# revision changes.
 #
-# PIPELINE_SESSIONS["session-a"] = {
-#     "revision": 1,
-#     "inputs": {...},
-#     "inputsFingerprint": "...",
-#
-#     "nodeStates": {
-#         "train": {
-#             "status": "started",
-#             "attempt": 1,
-#             "key": "...",
-#             "eventId": "event-3"
-#         }
-#     },
-#
-#     "cache": {
-#         "train": {
-#             "<cache-key>": {
-#                 "artifactDigest": "...",
-#                 "eventId": "..."
-#             }
-#         }
-#     },
-#
-#     "eventLedger": {
-#         "event-1": "<canonical event json>"
-#     }
-# }
-#
-# Cache and event IDs survive revisions.
-#
+# Attempt/running/retry/terminal state does NOT survive
+# revision changes.
+# =========================================================
+
 PIPELINE_SESSIONS = {}
 
 
 # =========================================================
-# BASIC HELPERS
+# GENERAL HELPERS
 # =========================================================
 
 def pipeline_is_safe_positive_int(value):
@@ -11174,7 +11150,7 @@ def pipeline_is_safe_positive_int(value):
 
 def pipeline_is_utf8_string(value):
     """
-    Valid UTF-8 string.
+    True only for a valid UTF-8 string.
     """
 
     if not isinstance(value, str):
@@ -11200,70 +11176,57 @@ def pipeline_is_nonempty_string(value):
 
 
 # =========================================================
-# HASH HELPERS
+# CONTENT-ADDRESSED HASHING
 # =========================================================
 
 def pipeline_hash_array(values):
     """
-    Compute:
+    SHA-256 over UTF-8 compact JSON array.
 
-    lowercase SHA-256(
-        UTF8(
-            compact JSON array
-        )
-    )
-
-    Exact value order is supplied by the caller.
+    Exact array order is supplied by caller.
     """
 
-    serialized = json.dumps(
+    compact = json.dumps(
         values,
         ensure_ascii=False,
         separators=(",", ":")
     )
 
-
     return hashlib.sha256(
-        serialized.encode("utf-8")
+        compact.encode("utf-8")
     ).hexdigest()
 
 
 def pipeline_inputs_fingerprint(inputs):
     """
-    Used ONLY for revision conflict detection.
+    Used for same-revision conflict detection.
 
-    All input fields matter, including extra metadata.
-
-    Object key order does not matter.
+    Includes ALL input fields, including extra metadata.
     """
 
-    serialized = json.dumps(
+    compact = json.dumps(
         inputs,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":")
     )
 
-
     return hashlib.sha256(
-        serialized.encode("utf-8")
+        compact.encode("utf-8")
     ).hexdigest()
 
 
 # =========================================================
-# CANONICAL EVENT REPRESENTATION
+# CANONICAL EVENT JSON
 # =========================================================
 
 def pipeline_canonical_event(event):
     """
-    Canonical event JSON with the exact eight fields
-    in the published order.
-
-    Used for global eventId replay/conflict detection.
+    Compact canonical JSON with EXACT eight fields
+    in the published event order.
     """
 
-    canonical_object = {
-
+    obj = {
         "eventId":
             event.get("eventId"),
 
@@ -11291,23 +11254,17 @@ def pipeline_canonical_event(event):
 
 
     return json.dumps(
-        canonical_object,
+        obj,
         ensure_ascii=False,
         separators=(",", ":")
     )
 
 
 # =========================================================
-# REQUEST VALIDATION
+# TOP-LEVEL REQUEST VALIDATION
 # =========================================================
 
 def pipeline_validate_request(body):
-    """
-    Validate the main request contract.
-
-    Returns:
-        True / False
-    """
 
     if not isinstance(body, dict):
         return False
@@ -11317,13 +11274,8 @@ def pipeline_validate_request(body):
     # session
     # -----------------------------------------------------
 
-    session = body.get(
-        "session"
-    )
-
-
     if not pipeline_is_nonempty_string(
-        session
+        body.get("session")
     ):
         return False
 
@@ -11332,13 +11284,8 @@ def pipeline_validate_request(body):
     # revision
     # -----------------------------------------------------
 
-    revision = body.get(
-        "revision"
-    )
-
-
     if not pipeline_is_safe_positive_int(
-        revision
+        body.get("revision")
     ):
         return False
 
@@ -11347,47 +11294,34 @@ def pipeline_validate_request(body):
     # inputs
     # -----------------------------------------------------
 
-    inputs = body.get(
-        "inputs"
-    )
+    inputs = body.get("inputs")
 
 
-    if not isinstance(
-        inputs,
-        dict
-    ):
+    if not isinstance(inputs, dict):
         return False
 
 
-    # All 12 required fields must be non-empty strings.
+    # All 12 named fields must exist and be non-empty.
     for field in PIPELINE_REQUIRED_INPUTS:
 
         if field not in inputs:
             return False
 
-
         if not pipeline_is_nonempty_string(
-            inputs[
-                field
-            ]
+            inputs[field]
         ):
             return False
 
 
-    # Extra metadata is explicitly allowed.
+    # Extra metadata inside inputs is allowed.
 
 
     # -----------------------------------------------------
     # events
     # -----------------------------------------------------
 
-    events = body.get(
-        "events"
-    )
-
-
     if not isinstance(
-        events,
+        body.get("events"),
         list
     ):
         return False
@@ -11397,16 +11331,13 @@ def pipeline_validate_request(body):
 
 
 # =========================================================
-# SESSION CREATION
+# NEW SESSION
 # =========================================================
 
 def pipeline_new_session_state(
     revision,
     inputs
 ):
-    """
-    Create a fresh session state.
-    """
 
     return {
 
@@ -11414,63 +11345,39 @@ def pipeline_new_session_state(
             revision,
 
         "inputs":
-            copy.deepcopy(
-                inputs
-            ),
+            copy.deepcopy(inputs),
 
         "inputsFingerprint":
             pipeline_inputs_fingerprint(
                 inputs
             ),
 
-        # Current revision's attempt/terminal states.
+        # Current revision only.
         "nodeStates": {},
 
-        # Successful content-addressed cache survives
-        # across revisions.
+        # Content-addressed successful cache.
         "cache": {
             node: {}
             for node in PIPELINE_NODES
         },
 
-        # Accepted event IDs survive across revisions.
+        # Accepted event IDs are permanent
+        # within this session.
         "eventLedger": {},
     }
 
 
 # =========================================================
-# CURRENT CACHE KEYS + DEPENDENCIES
+# CACHE KEYS AND DEPENDENCIES
 # =========================================================
 
 def pipeline_compute_keys_and_dependencies(
     state
 ):
-    """
-    Compute all currently available cache keys.
 
-    Important rule:
+    inputs = state["inputs"]
 
-        downstream key = null
-        until parent is reusable from cache.
-
-    Returns:
-
-        keys = {
-            node: key-or-None
-        }
-
-        dependencies = {
-            node: {...}
-        }
-    """
-
-    inputs = state[
-        "inputs"
-    ]
-
-    cache = state[
-        "cache"
-    ]
+    cache = state["cache"]
 
 
     keys = {}
@@ -11479,39 +11386,27 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # verify_data
+    # 1. VERIFY DATA
     #
     # [generation, checksum]
     # =====================================================
 
     verify_key = pipeline_hash_array([
-        inputs[
-            "generation"
-        ],
-        inputs[
-            "checksum"
-        ],
+        inputs["generation"],
+        inputs["checksum"],
     ])
 
 
-    keys[
-        "verify_data"
-    ] = verify_key
+    keys["verify_data"] = verify_key
 
 
-    dependencies[
-        "verify_data"
-    ] = {
+    dependencies["verify_data"] = {
 
         "generation":
-            inputs[
-                "generation"
-            ],
+            inputs["generation"],
 
         "checksum":
-            inputs[
-                "checksum"
-            ],
+            inputs["checksum"],
 
         "cacheKey":
             verify_key,
@@ -11519,15 +11414,14 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # prepare
+    # 2. PREPARE
     #
     # [canonicalData, prepareCode, prepareConfig]
     #
-    # But key is unavailable until verify_data
-    # is reusable.
+    # Key exists only after verify_data is reusable.
     # =====================================================
 
-    verify_cache_entry = (
+    verify_cached = (
         cache[
             "verify_data"
         ].get(
@@ -11536,18 +11430,12 @@ def pipeline_compute_keys_and_dependencies(
     )
 
 
-    if verify_cache_entry is not None:
+    if verify_cached is not None:
 
         prepare_key = pipeline_hash_array([
-            inputs[
-                "canonicalData"
-            ],
-            inputs[
-                "prepareCode"
-            ],
-            inputs[
-                "prepareConfig"
-            ],
+            inputs["canonicalData"],
+            inputs["prepareCode"],
+            inputs["prepareConfig"],
         ])
 
     else:
@@ -11555,29 +11443,19 @@ def pipeline_compute_keys_and_dependencies(
         prepare_key = None
 
 
-    keys[
-        "prepare"
-    ] = prepare_key
+    keys["prepare"] = prepare_key
 
 
-    dependencies[
-        "prepare"
-    ] = {
+    dependencies["prepare"] = {
 
         "canonicalData":
-            inputs[
-                "canonicalData"
-            ],
+            inputs["canonicalData"],
 
         "prepareCode":
-            inputs[
-                "prepareCode"
-            ],
+            inputs["prepareCode"],
 
         "prepareConfig":
-            inputs[
-                "prepareConfig"
-            ],
+            inputs["prepareConfig"],
 
         "cacheKey":
             prepare_key,
@@ -11585,7 +11463,7 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # train
+    # 3. TRAIN
     #
     # [prepareArtifact, trainCode, trainConfig, runtime]
     # =====================================================
@@ -11595,7 +11473,7 @@ def pipeline_compute_keys_and_dependencies(
 
     if prepare_key is not None:
 
-        prepare_cache_entry = (
+        prepare_cached = (
             cache[
                 "prepare"
             ].get(
@@ -11603,13 +11481,11 @@ def pipeline_compute_keys_and_dependencies(
             )
         )
 
-        if (
-            prepare_cache_entry
-            is not None
-        ):
+
+        if prepare_cached is not None:
 
             prepare_artifact = (
-                prepare_cache_entry[
+                prepare_cached[
                     "artifactDigest"
                 ]
             )
@@ -11619,15 +11495,9 @@ def pipeline_compute_keys_and_dependencies(
 
         train_key = pipeline_hash_array([
             prepare_artifact,
-            inputs[
-                "trainCode"
-            ],
-            inputs[
-                "trainConfig"
-            ],
-            inputs[
-                "runtime"
-            ],
+            inputs["trainCode"],
+            inputs["trainConfig"],
+            inputs["runtime"],
         ])
 
     else:
@@ -11635,32 +11505,22 @@ def pipeline_compute_keys_and_dependencies(
         train_key = None
 
 
-    keys[
-        "train"
-    ] = train_key
+    keys["train"] = train_key
 
 
-    dependencies[
-        "train"
-    ] = {
+    dependencies["train"] = {
 
         "prepareArtifact":
             prepare_artifact,
 
         "trainCode":
-            inputs[
-                "trainCode"
-            ],
+            inputs["trainCode"],
 
         "trainConfig":
-            inputs[
-                "trainConfig"
-            ],
+            inputs["trainConfig"],
 
         "runtime":
-            inputs[
-                "runtime"
-            ],
+            inputs["runtime"],
 
         "cacheKey":
             train_key,
@@ -11668,7 +11528,7 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # evaluate
+    # 4. EVALUATE
     #
     # [
     #   trainArtifact,
@@ -11683,7 +11543,7 @@ def pipeline_compute_keys_and_dependencies(
 
     if train_key is not None:
 
-        train_cache_entry = (
+        train_cached = (
             cache[
                 "train"
             ].get(
@@ -11692,13 +11552,10 @@ def pipeline_compute_keys_and_dependencies(
         )
 
 
-        if (
-            train_cache_entry
-            is not None
-        ):
+        if train_cached is not None:
 
             train_artifact = (
-                train_cache_entry[
+                train_cached[
                     "artifactDigest"
                 ]
             )
@@ -11708,15 +11565,9 @@ def pipeline_compute_keys_and_dependencies(
 
         evaluate_key = pipeline_hash_array([
             train_artifact,
-            inputs[
-                "canonicalData"
-            ],
-            inputs[
-                "evaluateCode"
-            ],
-            inputs[
-                "evaluateConfig"
-            ],
+            inputs["canonicalData"],
+            inputs["evaluateCode"],
+            inputs["evaluateConfig"],
         ])
 
     else:
@@ -11724,32 +11575,24 @@ def pipeline_compute_keys_and_dependencies(
         evaluate_key = None
 
 
-    keys[
-        "evaluate"
-    ] = evaluate_key
+    keys["evaluate"] = (
+        evaluate_key
+    )
 
 
-    dependencies[
-        "evaluate"
-    ] = {
+    dependencies["evaluate"] = {
 
         "trainArtifact":
             train_artifact,
 
         "canonicalData":
-            inputs[
-                "canonicalData"
-            ],
+            inputs["canonicalData"],
 
         "evaluateCode":
-            inputs[
-                "evaluateCode"
-            ],
+            inputs["evaluateCode"],
 
         "evaluateConfig":
-            inputs[
-                "evaluateConfig"
-            ],
+            inputs["evaluateConfig"],
 
         "cacheKey":
             evaluate_key,
@@ -11757,7 +11600,7 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # register
+    # 5. REGISTER
     #
     # [evaluateArtifact, schemaDigest]
     # =====================================================
@@ -11767,7 +11610,7 @@ def pipeline_compute_keys_and_dependencies(
 
     if evaluate_key is not None:
 
-        evaluate_cache_entry = (
+        evaluate_cached = (
             cache[
                 "evaluate"
             ].get(
@@ -11776,13 +11619,10 @@ def pipeline_compute_keys_and_dependencies(
         )
 
 
-        if (
-            evaluate_cache_entry
-            is not None
-        ):
+        if evaluate_cached is not None:
 
             evaluate_artifact = (
-                evaluate_cache_entry[
+                evaluate_cached[
                     "artifactDigest"
                 ]
             )
@@ -11792,9 +11632,7 @@ def pipeline_compute_keys_and_dependencies(
 
         register_key = pipeline_hash_array([
             evaluate_artifact,
-            inputs[
-                "schemaDigest"
-            ],
+            inputs["schemaDigest"],
         ])
 
     else:
@@ -11802,22 +11640,18 @@ def pipeline_compute_keys_and_dependencies(
         register_key = None
 
 
-    keys[
-        "register"
-    ] = register_key
+    keys["register"] = (
+        register_key
+    )
 
 
-    dependencies[
-        "register"
-    ] = {
+    dependencies["register"] = {
 
         "evaluateArtifact":
             evaluate_artifact,
 
         "schemaDigest":
-            inputs[
-                "schemaDigest"
-            ],
+            inputs["schemaDigest"],
 
         "cacheKey":
             register_key,
@@ -11825,7 +11659,7 @@ def pipeline_compute_keys_and_dependencies(
 
 
     # =====================================================
-    # publish
+    # 6. PUBLISH
     #
     # [registerArtifact, publishConfig]
     # =====================================================
@@ -11835,7 +11669,7 @@ def pipeline_compute_keys_and_dependencies(
 
     if register_key is not None:
 
-        register_cache_entry = (
+        register_cached = (
             cache[
                 "register"
             ].get(
@@ -11844,13 +11678,10 @@ def pipeline_compute_keys_and_dependencies(
         )
 
 
-        if (
-            register_cache_entry
-            is not None
-        ):
+        if register_cached is not None:
 
             register_artifact = (
-                register_cache_entry[
+                register_cached[
                     "artifactDigest"
                 ]
             )
@@ -11860,9 +11691,7 @@ def pipeline_compute_keys_and_dependencies(
 
         publish_key = pipeline_hash_array([
             register_artifact,
-            inputs[
-                "publishConfig"
-            ],
+            inputs["publishConfig"],
         ])
 
     else:
@@ -11870,22 +11699,18 @@ def pipeline_compute_keys_and_dependencies(
         publish_key = None
 
 
-    keys[
-        "publish"
-    ] = publish_key
+    keys["publish"] = (
+        publish_key
+    )
 
 
-    dependencies[
-        "publish"
-    ] = {
+    dependencies["publish"] = {
 
         "registerArtifact":
             register_artifact,
 
         "publishConfig":
-            inputs[
-                "publishConfig"
-            ],
+            inputs["publishConfig"],
 
         "cacheKey":
             publish_key,
@@ -11899,46 +11724,30 @@ def pipeline_compute_keys_and_dependencies(
 
 
 # =========================================================
-# EVENT STRUCTURE VALIDATION
+# EVENT SHAPE VALIDATION
 # =========================================================
 
 def pipeline_event_shape_valid(event):
     """
-    INVALID_EVENT is reserved for a malformed
-    event object itself.
+    Shape problems -> INVALID_EVENT.
 
-    Semantic problems such as:
-    - wrong node
-    - wrong key
-    - invalid status
-    - bad attempt
-    - bad receipt
-
-    are ignored instead, as required.
+    Semantic errors such as bad status/key/receipt/etc
+    are ignored later.
     """
 
-    if not isinstance(
-        event,
-        dict
-    ):
+    if not isinstance(event, dict):
         return False
 
 
-    # EXACTLY eight listed fields.
-    if set(
-        event.keys()
-    ) != PIPELINE_EVENT_FIELDS:
-
+    # Exactly eight fields.
+    if set(event.keys()) != PIPELINE_EVENT_FIELDS:
         return False
 
 
-    # eventId itself must be a usable global ID.
+    # Event ID must be usable.
     if not pipeline_is_nonempty_string(
-        event.get(
-            "eventId"
-        )
+        event.get("eventId")
     ):
-
         return False
 
 
@@ -11955,54 +11764,36 @@ def pipeline_event_semantically_valid(
     current_keys
 ):
     """
-    Returns:
-
-        (
-            True,
-            current_key
-        )
-
-    when the event is processable.
+    Bad semantic events are ignored.
 
     Returns:
+        (True, current_key)
 
-        (
-            False,
-            None
-        )
-
-    for events that the specification says to IGNORE.
+    or:
+        (False, None)
     """
 
 
-    current_revision = (
-        state[
-            "revision"
-        ]
-    )
-
+    # -----------------------------------------------------
+    # Revision
+    # -----------------------------------------------------
 
     event_revision = event.get(
         "revision"
     )
 
 
-    # -----------------------------------------------------
-    # Wrong or malformed revision -> ignore.
-    # -----------------------------------------------------
-
     if not pipeline_is_safe_positive_int(
         event_revision
     ):
-
         return False, None
 
 
+    # Older/wrong revision is stale.
     if (
         event_revision
-        != current_revision
+        != state["revision"]
     ):
-
         return False, None
 
 
@@ -12010,13 +11801,10 @@ def pipeline_event_semantically_valid(
     # Node
     # -----------------------------------------------------
 
-    node = event.get(
-        "node"
-    )
+    node = event.get("node")
 
 
     if node not in PIPELINE_NODES:
-
         return False, None
 
 
@@ -12032,7 +11820,6 @@ def pipeline_event_semantically_valid(
     if not pipeline_is_safe_positive_int(
         attempt
     ):
-
         return False, None
 
 
@@ -12046,31 +11833,22 @@ def pipeline_event_semantically_valid(
 
 
     if status not in PIPELINE_STATUSES:
-
         return False, None
 
 
     # -----------------------------------------------------
-    # Node must currently be ready.
-    #
-    # If parent is not reusable, key is null.
+    # Current key / parent readiness
     # -----------------------------------------------------
 
     current_key = (
-        current_keys.get(
-            node
-        )
+        current_keys.get(node)
     )
 
 
+    # Parent unavailable.
     if current_key is None:
-
         return False, None
 
-
-    # -----------------------------------------------------
-    # Event key must be the current key.
-    # -----------------------------------------------------
 
     supplied_key = event.get(
         "key"
@@ -12084,45 +11862,39 @@ def pipeline_event_semantically_valid(
         or supplied_key
         != current_key
     ):
-
         return False, None
 
 
-    artifact_digest = event.get(
+    # -----------------------------------------------------
+    # Artifact rules
+    # -----------------------------------------------------
+
+    artifact = event.get(
         "artifactDigest"
     )
 
 
-    receipt_id = event.get(
-        "receiptId"
-    )
-
-
-    # =====================================================
-    # Artifact rules
-    # =====================================================
-
     if status == "succeeded":
 
-        # Success requires a non-empty artifact.
         if not pipeline_is_nonempty_string(
-            artifact_digest
+            artifact
         ):
-
             return False, None
-
 
     else:
 
-        # Every non-success event requires null artifact.
-        if artifact_digest is not None:
-
+        if artifact is not None:
             return False, None
 
 
-    # =====================================================
+    # -----------------------------------------------------
     # Receipt rules
-    # =====================================================
+    # -----------------------------------------------------
+
+    receipt = event.get(
+        "receiptId"
+    )
+
 
     if (
         status == "succeeded"
@@ -12140,16 +11912,14 @@ def pipeline_event_semantically_valid(
         )
 
 
-        if receipt_id != expected_receipt:
-
+        if receipt != expected_receipt:
             return False, None
 
 
     else:
 
-        # Every other event requires null receipt.
-        if receipt_id is not None:
-
+        # All other events require null receipt.
+        if receipt is not None:
             return False, None
 
 
@@ -12169,32 +11939,19 @@ def pipeline_accept_event(
     canonical_event,
     current_key
 ):
-    """
-    Permanently consume one accepted event ID and update
-    current state/cache.
-
-    The caller works on a copied session, so all mutations
-    remain atomic until the whole batch succeeds.
-    """
 
     event_id = event[
         "eventId"
     ]
 
-    node = event[
-        "node"
-    ]
+    node = event["node"]
 
-    attempt = event[
-        "attempt"
-    ]
+    attempt = event["attempt"]
 
-    status = event[
-        "status"
-    ]
+    status = event["status"]
 
 
-    # Event ID is now consumed globally in this session.
+    # Accepted IDs become permanent.
     state[
         "eventLedger"
     ][
@@ -12203,7 +11960,7 @@ def pipeline_accept_event(
 
 
     # -----------------------------------------------------
-    # started
+    # STARTED
     # -----------------------------------------------------
 
     if status == "started":
@@ -12229,7 +11986,7 @@ def pipeline_accept_event(
 
 
     # -----------------------------------------------------
-    # retryable failure
+    # RETRYABLE FAILED
     # -----------------------------------------------------
 
     elif status == "retryable_failed":
@@ -12255,7 +12012,7 @@ def pipeline_accept_event(
 
 
     # -----------------------------------------------------
-    # terminal failure
+    # TERMINAL FAILED
     # -----------------------------------------------------
 
     elif status == "terminal_failed":
@@ -12281,20 +12038,17 @@ def pipeline_accept_event(
 
 
     # -----------------------------------------------------
-    # success
+    # SUCCEEDED
     # -----------------------------------------------------
 
     elif status == "succeeded":
 
-        artifact_digest = (
-            event[
-                "artifactDigest"
-            ]
-        )
+        artifact = event[
+            "artifactDigest"
+        ]
 
 
-        # Permanently bind this key to its first
-        # artifact and event ID.
+        # Permanently bind first success evidence.
         state[
             "cache"
         ][
@@ -12304,7 +12058,7 @@ def pipeline_accept_event(
         ] = {
 
             "artifactDigest":
-                artifact_digest,
+                artifact,
 
             "eventId":
                 event_id,
@@ -12339,23 +12093,10 @@ def pipeline_process_event(
     state,
     event
 ):
-    """
-    Return:
 
-        ("accept", None)
-
-        ("ignore", None)
-
-        ("conflict", "EVENT_ID_CONFLICT")
-        ("conflict", "EVIDENCE_CONFLICT")
-        ("conflict", "STATUS_CONFLICT")
-        ("conflict", "INVALID_EVENT")
-    """
-
-
-    # =====================================================
-    # 1. Event must have the exact required shape.
-    # =====================================================
+    # -----------------------------------------------------
+    # 1. Exact event structure
+    # -----------------------------------------------------
 
     if not pipeline_event_shape_valid(
         event
@@ -12363,7 +12104,7 @@ def pipeline_process_event(
 
         return (
             "conflict",
-            "INVALID_EVENT",
+            "INVALID_EVENT"
         )
 
 
@@ -12379,11 +12120,11 @@ def pipeline_process_event(
     )
 
 
-    # =====================================================
-    # 2. Global event ID replay/conflict
-    # =====================================================
+    # -----------------------------------------------------
+    # 2. Event ID replay / conflict
+    # -----------------------------------------------------
 
-    existing_event = (
+    existing = (
         state[
             "eventLedger"
         ].get(
@@ -12392,45 +12133,40 @@ def pipeline_process_event(
     )
 
 
-    if existing_event is not None:
+    if existing is not None:
 
-
-        # Exact replay is ignored.
-        if (
-            existing_event
-            == canonical_event
-        ):
+        # Exact replay.
+        if existing == canonical_event:
 
             return (
                 "ignore",
-                None,
+                None
             )
 
 
-        # Same consumed ID with different event evidence.
+        # Same consumed ID with different evidence.
         return (
             "conflict",
-            "EVENT_ID_CONFLICT",
+            "EVENT_ID_CONFLICT"
         )
 
 
-    # =====================================================
-    # 3. Recompute current keys before EVERY event.
+    # -----------------------------------------------------
+    # 3. Recompute keys before EACH event.
     #
-    # An earlier event in this same batch may have
-    # successfully unlocked the next DAG node.
-    # =====================================================
+    # A success earlier in this same batch may unlock
+    # the next DAG node.
+    # -----------------------------------------------------
 
-    (
-        current_keys,
-        _
-    ) = pipeline_compute_keys_and_dependencies(
-        state
+    current_keys, _ = (
+        pipeline_compute_keys_and_dependencies(
+            state
+        )
     )
 
 
     (
-        semantic_valid,
+        semantically_valid,
         current_key
     ) = pipeline_event_semantically_valid(
         event,
@@ -12439,33 +12175,27 @@ def pipeline_process_event(
     )
 
 
-    # Wrong revision/node/key, unavailable parent,
-    # invalid attempt/status/artifact/receipt => IGNORE.
+    # Invalid status, receipt, key, revision, node,
+    # artifact, attempt, unavailable parent etc.
     #
-    # Ignored events DO NOT consume event IDs.
-    if not semantic_valid:
+    # Ignored event IDs are NOT consumed.
+    if not semantically_valid:
 
         return (
             "ignore",
-            None,
+            None
         )
 
 
-    node = event[
-        "node"
-    ]
+    node = event["node"]
 
-    attempt = event[
-        "attempt"
-    ]
+    attempt = event["attempt"]
 
-    status = event[
-        "status"
-    ]
+    status = event["status"]
 
 
     # =====================================================
-    # 4. Existing immutable cache
+    # 4. CURRENT CACHE EXISTS
     # =====================================================
 
     cache_entry = (
@@ -12481,9 +12211,7 @@ def pipeline_process_event(
 
     if cache_entry is not None:
 
-
-        # A new success with different immutable evidence
-        # is an evidence conflict.
+        # New success with DIFFERENT immutable artifact.
         if (
             status == "succeeded"
 
@@ -12497,21 +12225,19 @@ def pipeline_process_event(
 
             return (
                 "conflict",
-                "EVIDENCE_CONFLICT",
+                "EVIDENCE_CONFLICT"
             )
 
 
-        # Any other NEW valid event after success conflicts.
-        #
-        # Exact replay was already handled above.
+        # Any other NEW valid event against cached success.
         return (
             "conflict",
-            "STATUS_CONFLICT",
+            "STATUS_CONFLICT"
         )
 
 
     # =====================================================
-    # 5. Current non-cached node state
+    # 5. CURRENT NON-CACHED STATE
     # =====================================================
 
     previous = (
@@ -12523,13 +12249,10 @@ def pipeline_process_event(
     )
 
 
-    # Defensive protection:
-    # only a state for this exact current key matters.
+    # Ignore a stale state belonging to another key.
     if (
         previous is not None
-        and previous.get(
-            "key"
-        )
+        and previous.get("key")
         != current_key
     ):
 
@@ -12537,13 +12260,13 @@ def pipeline_process_event(
 
 
     # =====================================================
-    # CASE A: no state
+    # NONE
+    #
+    # Only started(1) accepted.
     # =====================================================
 
     if previous is None:
 
-
-        # Only started(1) is accepted.
         if (
             status == "started"
             and attempt == 1
@@ -12558,15 +12281,15 @@ def pipeline_process_event(
 
             return (
                 "accept",
-                None,
+                None
             )
 
 
-        # Completion without start, or attempt > 1,
-        # is ignored.
+        # Completion without first start,
+        # or attempt > 1.
         return (
             "ignore",
-            None,
+            None
         )
 
 
@@ -12584,9 +12307,9 @@ def pipeline_process_event(
 
 
     # =====================================================
-    # CASE B: terminal_failed
+    # TERMINAL FAILED
     #
-    # Any NEW valid event is a STATUS_CONFLICT.
+    # ANY new valid event conflicts.
     # =====================================================
 
     if (
@@ -12596,27 +12319,26 @@ def pipeline_process_event(
 
         return (
             "conflict",
-            "STATUS_CONFLICT",
+            "STATUS_CONFLICT"
         )
 
 
     # =====================================================
-    # CASE C: started(n)
+    # STARTED(n)
     # =====================================================
 
     if previous_status == "started":
 
-
-        # Lower attempt is stale -> ignore.
+        # Lower attempt is stale.
         if attempt < previous_attempt:
 
             return (
                 "ignore",
-                None,
+                None
             )
 
 
-        # Completion on exactly the same attempt.
+        # Same attempt can complete.
         if (
             attempt == previous_attempt
 
@@ -12636,19 +12358,18 @@ def pipeline_process_event(
 
             return (
                 "accept",
-                None,
+                None
             )
 
 
-        # Any other transition conflicts.
         return (
             "conflict",
-            "STATUS_CONFLICT",
+            "STATUS_CONFLICT"
         )
 
 
     # =====================================================
-    # CASE D: retryable_failed(n)
+    # RETRYABLE_FAILED(n)
     # =====================================================
 
     if (
@@ -12656,17 +12377,16 @@ def pipeline_process_event(
         == "retryable_failed"
     ):
 
-
-        # Lower attempt is stale.
+        # Lower attempt ignored.
         if attempt < previous_attempt:
 
             return (
                 "ignore",
-                None,
+                None
             )
 
 
-        # Only started(n+1) is allowed.
+        # Only started(n+1) accepted.
         if (
             status == "started"
 
@@ -12683,36 +12403,32 @@ def pipeline_process_event(
 
             return (
                 "accept",
-                None,
+                None
             )
 
 
         return (
             "conflict",
-            "STATUS_CONFLICT",
+            "STATUS_CONFLICT"
         )
 
 
-    # =====================================================
-    # succeeded state should always have matching cache.
-    # If somehow reached, conservatively conflict.
-    # =====================================================
-
+    # Defensive fallback.
     return (
         "conflict",
-        "STATUS_CONFLICT",
+        "STATUS_CONFLICT"
     )
 
 
 # =========================================================
-# BUILD FINAL NODE RESPONSE
+# BUILD NODE RESPONSE
 # =========================================================
 
 def pipeline_build_nodes(state):
     """
-    Build node decisions in fixed DAG order.
+    DAG order is preserved.
 
-    Every node gets EXACTLY one reason code.
+    Exactly ONE reasonCode for every node.
     """
 
     (
@@ -12723,58 +12439,40 @@ def pipeline_build_nodes(state):
     )
 
 
-    output_nodes = []
+    result_nodes = []
 
 
-    # Used to propagate pending/terminal reason
-    # and triggering IDs downstream.
     previous_result = None
 
 
     for node in PIPELINE_NODES:
 
-        current_key = (
-            keys[
-                node
-            ]
-        )
+        current_key = keys[
+            node
+        ]
 
 
         # =================================================
-        # Parent unavailable
+        # PARENT NOT REUSABLE
         # =================================================
 
         if current_key is None:
 
+            if (
+                previous_result is not None
 
-            # First node can never have null key.
-            if previous_result is not None:
+                and previous_result[
+                    "reasonCodes"
+                ][0]
+                in (
+                    "TERMINAL_FAILURE",
+                    "UPSTREAM_TERMINAL",
+                )
+            ):
 
-
-                if (
-                    previous_result[
-                        "reasonCodes"
-                    ][0]
-                    in (
-                        "TERMINAL_FAILURE",
-                        "UPSTREAM_TERMINAL",
-                    )
-                ):
-
-                    reason = (
-                        "UPSTREAM_TERMINAL"
-                    )
-
-
-                else:
-
-                    reason = (
-                        "UPSTREAM_PENDING"
-                    )
-
-
-                triggering_ids = []
-
+                reason = (
+                    "UPSTREAM_TERMINAL"
+                )
 
             else:
 
@@ -12782,10 +12480,13 @@ def pipeline_build_nodes(state):
                     "UPSTREAM_PENDING"
                 )
 
-                triggering_ids = []
+
+            # Descendant is indirectly blocked.
+            # No event happened on this node itself.
+            triggering_ids = []
 
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -12808,18 +12509,20 @@ def pipeline_build_nodes(state):
             }
 
 
-            output_nodes.append(
-                result
+            result_nodes.append(
+                node_result
             )
 
 
-            previous_result = result
+            previous_result = (
+                node_result
+            )
 
             continue
 
 
         # =================================================
-        # Cache hit
+        # CACHE HIT
         # =================================================
 
         cache_entry = (
@@ -12835,7 +12538,7 @@ def pipeline_build_nodes(state):
 
         if cache_entry is not None:
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -12853,7 +12556,6 @@ def pipeline_build_nodes(state):
                         node
                     ],
 
-                # Immutable original success event.
                 "triggeringEventIds":
                     [
                         cache_entry[
@@ -12863,18 +12565,20 @@ def pipeline_build_nodes(state):
             }
 
 
-            output_nodes.append(
-                result
+            result_nodes.append(
+                node_result
             )
 
 
-            previous_result = result
+            previous_result = (
+                node_result
+            )
 
             continue
 
 
         # =================================================
-        # Current state for this key
+        # NON-CACHED CURRENT STATE
         # =================================================
 
         state_entry = (
@@ -12886,6 +12590,7 @@ def pipeline_build_nodes(state):
         )
 
 
+        # Ignore state for old key.
         if (
             state_entry is not None
 
@@ -12899,18 +12604,17 @@ def pipeline_build_nodes(state):
 
 
         # -------------------------------------------------
-        # Running
+        # RUNNING
         # -------------------------------------------------
 
         if (
             state_entry is not None
-
             and state_entry[
                 "status"
             ] == "started"
         ):
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -12938,7 +12642,7 @@ def pipeline_build_nodes(state):
 
 
         # -------------------------------------------------
-        # Retryable failure
+        # RETRYABLE FAILURE
         # -------------------------------------------------
 
         elif (
@@ -12950,7 +12654,7 @@ def pipeline_build_nodes(state):
             == "retryable_failed"
         ):
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -12978,7 +12682,7 @@ def pipeline_build_nodes(state):
 
 
         # -------------------------------------------------
-        # Terminal failure
+        # TERMINAL FAILURE
         # -------------------------------------------------
 
         elif (
@@ -12990,7 +12694,7 @@ def pipeline_build_nodes(state):
             == "terminal_failed"
         ):
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -13018,12 +12722,12 @@ def pipeline_build_nodes(state):
 
 
         # -------------------------------------------------
-        # Ready but no cache/state
+        # READY + NO CACHE
         # -------------------------------------------------
 
         else:
 
-            result = {
+            node_result = {
 
                 "node":
                     node,
@@ -13046,19 +12750,144 @@ def pipeline_build_nodes(state):
             }
 
 
-        output_nodes.append(
-            result
+        result_nodes.append(
+            node_result
         )
 
 
-        previous_result = result
+        previous_result = (
+            node_result
+        )
 
 
-    return output_nodes
+    return result_nodes
 
 
 # =========================================================
-# MAIN /pipeline ENDPOINT
+# STALE TOP-LEVEL REVISION READBACK
+# =========================================================
+
+def pipeline_handle_stale_request(
+    state,
+    events,
+    request_id,
+    supplied_revision
+):
+    """
+    Do not roll the controller backward.
+
+    Structurally valid stale events are ignored and
+    do not consume IDs.
+
+    Already-consumed event IDs still obey the global
+    replay/conflict rule.
+    """
+
+    ignored_ids = []
+
+
+    for event in events:
+
+        # Malformed event object still conflicts.
+        if not pipeline_event_shape_valid(
+            event
+        ):
+
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error":
+                        "INVALID_EVENT"
+                }
+            )
+
+
+        event_id = event[
+            "eventId"
+        ]
+
+
+        canonical = (
+            pipeline_canonical_event(
+                event
+            )
+        )
+
+
+        previous = (
+            state[
+                "eventLedger"
+            ].get(
+                event_id
+            )
+        )
+
+
+        if previous is not None:
+
+            # Same ID but different evidence.
+            if previous != canonical:
+
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error":
+                            "EVENT_ID_CONFLICT"
+                    }
+                )
+
+
+        # Exact replay OR new stale event:
+        # both are ignored.
+        ignored_ids.append(
+            event_id
+        )
+
+
+    response = {
+
+        # Durable/current revision.
+        "revision":
+            state[
+                "revision"
+            ],
+
+        "acceptedEventIds":
+            [],
+
+        "ignoredEventIds":
+            ignored_ids,
+
+        "nodes":
+            pipeline_build_nodes(
+                state
+            ),
+    }
+
+
+    audit(
+        request_id,
+        "PIPELINE_STALE_READBACK",
+        {
+            "suppliedRevision":
+                supplied_revision,
+
+            "currentRevision":
+                state[
+                    "revision"
+                ],
+
+            "response":
+                response,
+        }
+    )
+
+
+    return response
+
+
+# =========================================================
+# MAIN ENDPOINT
 # =========================================================
 
 @app.post("/pipeline")
@@ -13131,7 +12960,6 @@ async def pipeline_endpoint(
         )
 
 
-        # Q6 defines all controller errors as HTTP 409.
         return JSONResponse(
             status_code=409,
             content={
@@ -13142,7 +12970,7 @@ async def pipeline_endpoint(
 
 
     # =====================================================
-    # 2. REQUEST VALIDATION
+    # 2. TOP-LEVEL VALIDATION
     # =====================================================
 
     if not pipeline_validate_request(
@@ -13196,31 +13024,27 @@ async def pipeline_endpoint(
                 inputs,
 
             "eventCount":
-                len(
-                    events
-                ),
+                len(events),
         }
     )
 
 
     # =====================================================
-    # 3. PREPARE A WORKING COPY
-    #
-    # Nothing is committed until the whole batch succeeds.
+    # 3. GET DURABLE SESSION STATE
     # =====================================================
 
-    existing_state = (
+    durable_state = (
         PIPELINE_SESSIONS.get(
             session
         )
     )
 
 
-    # -----------------------------------------------------
-    # New session
-    # -----------------------------------------------------
+    # =====================================================
+    # 4. BRAND-NEW SESSION
+    # =====================================================
 
-    if existing_state is None:
+    if durable_state is None:
 
         working_state = (
             pipeline_new_session_state(
@@ -13230,30 +13054,46 @@ async def pipeline_endpoint(
         )
 
 
-    # -----------------------------------------------------
-    # Existing session
-    # -----------------------------------------------------
+    # =====================================================
+    # 5. EXISTING SESSION
+    # =====================================================
 
     else:
 
-        working_state = copy.deepcopy(
-            existing_state
-        )
-
-
         current_revision = (
-            working_state[
+            durable_state[
                 "revision"
             ]
         )
 
 
-        # =================================================
-        # Same revision
-        # =================================================
+        # -------------------------------------------------
+        # Older top-level request.
+        #
+        # Do not rewind state.
+        # -------------------------------------------------
+
+        if revision < current_revision:
+
+            return pipeline_handle_stale_request(
+                durable_state,
+                events,
+                request_id,
+                revision
+            )
+
+
+        # Work on COPY for atomic batch rollback.
+        working_state = copy.deepcopy(
+            durable_state
+        )
+
+
+        # -------------------------------------------------
+        # SAME REVISION
+        # -------------------------------------------------
 
         if revision == current_revision:
-
 
             supplied_fingerprint = (
                 pipeline_inputs_fingerprint(
@@ -13262,8 +13102,7 @@ async def pipeline_endpoint(
             )
 
 
-            # Same revision + ANY different input,
-            # including extra metadata.
+            # Any changed input, including metadata.
             if (
                 supplied_fingerprint
                 != working_state[
@@ -13293,14 +13132,20 @@ async def pipeline_endpoint(
                 )
 
 
-        # =================================================
-        # Newer revision
-        # =================================================
+        # -------------------------------------------------
+        # NEWER REVISION
+        # -------------------------------------------------
 
-        elif revision > current_revision:
+        else:
+
+            old_revision = (
+                working_state[
+                    "revision"
+                ]
+            )
 
 
-            # Replace inputs.
+            # Replace current inputs.
             working_state[
                 "revision"
             ] = revision
@@ -13322,15 +13167,16 @@ async def pipeline_endpoint(
             )
 
 
-            # IMPORTANT:
-            # Clear current attempt / terminal state.
+            # Clear running/retry/terminal/attempt state.
             working_state[
                 "nodeStates"
             ] = {}
 
 
-            # Cache stays.
-            # Event ledger stays.
+            # DO NOT clear:
+            #
+            # working_state["cache"]
+            # working_state["eventLedger"]
 
 
             audit(
@@ -13338,7 +13184,7 @@ async def pipeline_endpoint(
                 "PIPELINE_NEW_REVISION",
                 {
                     "oldRevision":
-                        current_revision,
+                        old_revision,
 
                     "newRevision":
                         revision,
@@ -13346,98 +13192,8 @@ async def pipeline_endpoint(
             )
 
 
-        # =================================================
-        # Older request revision
-        #
-        # The controller must never roll state backward.
-        
-        # Treat the request as stale readback:
-        # - keep the current revision
-        # - keep the current inputs
-        # - keep cache/state unchanged
-        # - well-formed stale events are ignored
-        # =================================================
-
-        else:
-
-            ignored_event_ids = []
-
-            for event in events:
-
-                if not pipeline_event_shape_valid(
-                    event
-                 ):
-
-                    audit(
-                        request_id,
-                        "PIPELINE_STALE_INVALID_EVENT",
-                        {
-                            "suppliedRevision":
-                                revision,
-
-                            "currentRevision":
-                                current_revision,
-                            }
-                    )
-
-                    return JSONResponse(
-                        status_code=409,
-                        content={
-                            "error":
-                                "REVISION_CONFLICT"
-                }
-            )
-
-                # Stale events do NOT consume their IDs.
-                ignored_event_ids.append(
-                    event[
-                    "eventId"
-                    ]
-                    )
-
-        nodes = pipeline_build_nodes(
-            working_state
-            )
-
-        response = {
-
-        # IMPORTANT:
-        # Return the durable/current revision,
-        # not the stale supplied revision.
-            "revision":
-                current_revision,
-
-            "acceptedEventIds":
-                [],
-
-            "ignoredEventIds":
-                ignored_event_ids,
-
-            "nodes":
-                nodes,
-      }
-
-        audit(
-            request_id,
-            "PIPELINE_STALE_READBACK",
-        {
-                "suppliedRevision":
-                    revision,
-
-                "currentRevision":
-                    current_revision,
-
-                "response":
-                    response,
-        }
-    )
-
-
-    return response
-
-
     # =====================================================
-    # 4. PROCESS EVENT BATCH IN INPUT ORDER
+    # 6. PROCESS THE EVENT BATCH ATOMICALLY
     # =====================================================
 
     accepted_event_ids = []
@@ -13446,12 +13202,11 @@ async def pipeline_endpoint(
 
 
     for (
-        event_index,
+        index,
         event
     ) in enumerate(
         events
     ):
-
 
         (
             outcome,
@@ -13462,24 +13217,30 @@ async def pipeline_endpoint(
         )
 
 
+        event_id_for_log = None
+
+
+        if isinstance(
+            event,
+            dict
+        ):
+
+            event_id_for_log = (
+                event.get(
+                    "eventId"
+                )
+            )
+
+
         audit(
             request_id,
             "PIPELINE_EVENT_RESULT",
             {
                 "index":
-                    event_index,
+                    index,
 
                 "eventId":
-                    (
-                        event.get(
-                            "eventId"
-                        )
-                        if isinstance(
-                            event,
-                            dict
-                        )
-                        else None
-                    ),
+                    event_id_for_log,
 
                 "outcome":
                     outcome,
@@ -13491,7 +13252,7 @@ async def pipeline_endpoint(
 
 
         # -------------------------------------------------
-        # Accepted
+        # ACCEPTED
         # -------------------------------------------------
 
         if outcome == "accept":
@@ -13504,13 +13265,11 @@ async def pipeline_endpoint(
 
 
         # -------------------------------------------------
-        # Ignored
+        # IGNORED
         # -------------------------------------------------
 
         elif outcome == "ignore":
 
-            # Shape is known valid for semantic ignores
-            # and exact replay.
             ignored_event_ids.append(
                 event[
                     "eventId"
@@ -13519,11 +13278,11 @@ async def pipeline_endpoint(
 
 
         # -------------------------------------------------
-        # Conflict
+        # CONFLICT
         #
-        # ROLLBACK ENTIRE REQUEST.
+        # working_state is only a copy.
         #
-        # working_state has not yet been committed.
+        # Nothing from this request is persisted.
         # -------------------------------------------------
 
         else:
@@ -13554,7 +13313,7 @@ async def pipeline_endpoint(
 
 
     # =====================================================
-    # 5. BUILD FINAL DAG VIEW
+    # 7. BUILD CURRENT DAG VIEW
     # =====================================================
 
     nodes = pipeline_build_nodes(
@@ -13563,9 +13322,7 @@ async def pipeline_endpoint(
 
 
     # =====================================================
-    # 6. COMMIT STATE
-    #
-    # Only now does the batch become durable.
+    # 8. COMMIT ONLY AFTER ENTIRE BATCH SUCCEEDS
     # =====================================================
 
     PIPELINE_SESSIONS[
@@ -13574,13 +13331,15 @@ async def pipeline_endpoint(
 
 
     # =====================================================
-    # 7. EXACT RESPONSE SHAPE
+    # 9. EXACT RESPONSE
     # =====================================================
 
     response = {
 
         "revision":
-            revision,
+            working_state[
+                "revision"
+            ],
 
         "acceptedEventIds":
             accepted_event_ids,
@@ -13594,7 +13353,7 @@ async def pipeline_endpoint(
 
 
     # =====================================================
-    # AUDIT
+    # 10. AUDIT
     # =====================================================
 
     audit(
@@ -13611,3 +13370,4 @@ async def pipeline_endpoint(
 
 
     return response
+
