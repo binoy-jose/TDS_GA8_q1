@@ -13371,3 +13371,1890 @@ async def pipeline_endpoint(
 
     return response
 
+
+
+# =========================================================
+# WEEK 8 - Q7
+# Publish a Verifiable Model Bundle and Model Card
+# Endpoint: POST /verify-bundle
+# =========================================================
+
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+VERIFY_BUNDLE_REQUIRED_FILES = [
+    "README.md",
+    "training_manifest.json",
+    "evaluation.json",
+    "inventory.json",
+    "adapter_model.safetensors",
+    "adapter_config.json",
+]
+
+
+VERIFY_BUNDLE_REQUIRED_SET = set(
+    VERIFY_BUNDLE_REQUIRED_FILES
+)
+
+
+VERIFY_BUNDLE_UNSAFE_EXTENSIONS = (
+    ".bin",
+    ".pt",
+    ".pth",
+    ".pkl",
+    ".pickle",
+)
+
+
+VERIFY_BUNDLE_BASE_REVISION_RE = re.compile(
+    r"^[0-9a-f]{40}$"
+)
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def bundle_is_number(value):
+    """
+    Numeric value but NOT Boolean.
+    """
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    )
+
+
+def bundle_is_finite_number(value):
+    """
+    True only for finite numbers.
+    """
+
+    return (
+        bundle_is_number(value)
+        and math.isfinite(float(value))
+    )
+
+
+def bundle_is_safe_positive_int(value):
+    """
+    Positive JavaScript-safe integer.
+    """
+
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= SAFE_INTEGER_MAX
+    )
+
+
+def bundle_is_utf8_string(value):
+    """
+    True only when value is a valid UTF-8 string.
+    """
+
+    if not isinstance(value, str):
+        return False
+
+    try:
+
+        value.encode("utf-8")
+
+        return True
+
+    except UnicodeEncodeError:
+
+        return False
+
+
+def bundle_is_nonempty_string(value):
+    """
+    Non-empty valid UTF-8 string.
+    """
+
+    return (
+        bundle_is_utf8_string(value)
+        and value != ""
+    )
+
+
+def bundle_sort_codes(codes):
+    """
+    Sort and deduplicate violation codes by UTF-8 bytes.
+    """
+
+    return sorted(
+        set(codes),
+        key=lambda value:
+            value.encode("utf-8")
+    )
+
+
+def bundle_sha256_text(value):
+    """
+    Lowercase SHA-256 of exact UTF-8 bytes.
+    """
+
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
+
+
+# =========================================================
+# POLICY VALIDATION
+# =========================================================
+
+def bundle_validate_policy(policy):
+    """
+    Validate:
+
+    requiredSlices:
+        non-empty array
+        unique
+        non-empty strings
+
+    license/intendedUse/limitations:
+        non-empty strings
+    """
+
+    if not isinstance(policy, dict):
+
+        return False
+
+
+    required_slices = policy.get(
+        "requiredSlices"
+    )
+
+
+    if (
+        not isinstance(
+            required_slices,
+            list
+        )
+        or len(
+            required_slices
+        ) == 0
+    ):
+
+        return False
+
+
+    seen = set()
+
+
+    for slice_name in required_slices:
+
+
+        if not bundle_is_nonempty_string(
+            slice_name
+        ):
+
+            return False
+
+
+        if slice_name in seen:
+
+            return False
+
+
+        seen.add(
+            slice_name
+        )
+
+
+    for field in (
+        "license",
+        "intendedUse",
+        "limitations",
+    ):
+
+        if not bundle_is_nonempty_string(
+            policy.get(
+                field
+            )
+        ):
+
+            return False
+
+
+    return True
+
+
+# =========================================================
+# SAFE JSON PARSER FOR FILE CONTENT
+# =========================================================
+
+def bundle_parse_json_file(
+    filename,
+    files,
+    violations
+):
+    """
+    Parse one JSON bundle file using strict JSON.
+
+    Returns parsed object or None.
+    """
+
+    if filename not in files:
+
+        return None
+
+
+    raw_value = files[
+        filename
+    ]
+
+
+    if not bundle_is_utf8_string(
+        raw_value
+    ):
+
+        return None
+
+
+    try:
+
+        return strict_json_loads(
+            raw_value
+        )
+
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+    ):
+
+        violations.append(
+            "INVALID_JSON:"
+            + filename
+        )
+
+        return None
+
+
+# =========================================================
+# RECOMPUTE INVENTORY
+# =========================================================
+
+def bundle_recompute_inventory(
+    files,
+    violations
+):
+    """
+    Recompute inventory from every actual file except
+    inventory.json.
+
+    Exact entry key order:
+
+        name
+        bytes
+        sha256
+
+    Returns:
+
+        (
+            success,
+            recomputed_inventory,
+            compact_inventory_json,
+            inventory_digest
+        )
+    """
+
+    inventory = []
+
+
+    for (
+        filename,
+        content
+    ) in files.items():
+
+
+        if filename == "inventory.json":
+
+            continue
+
+
+        # Filename must itself be valid UTF-8.
+        if not bundle_is_nonempty_string(
+            filename
+        ):
+
+            violations.append(
+                "INVALID_FILE:"
+                + str(filename)
+            )
+
+            return (
+                False,
+                [],
+                None,
+                None,
+            )
+
+
+        # All file contents must be UTF-8 strings.
+        if not bundle_is_utf8_string(
+            content
+        ):
+
+            violations.append(
+                "INVALID_FILE:"
+                + filename
+            )
+
+            return (
+                False,
+                [],
+                None,
+                None,
+            )
+
+
+        raw_bytes = content.encode(
+            "utf-8"
+        )
+
+
+        # IMPORTANT:
+        # Preserve this exact dictionary key order.
+        inventory.append({
+
+            "name":
+                filename,
+
+            "bytes":
+                len(
+                    raw_bytes
+                ),
+
+            "sha256":
+                hashlib.sha256(
+                    raw_bytes
+                ).hexdigest(),
+        })
+
+
+    # UTF-8 filename ordering.
+    inventory = sorted(
+        inventory,
+        key=lambda entry:
+            entry[
+                "name"
+            ].encode(
+                "utf-8"
+            )
+    )
+
+
+    # Exact compact JSON.
+    compact_inventory = json.dumps(
+        inventory,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+
+    inventory_digest = hashlib.sha256(
+        compact_inventory.encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+    return (
+        True,
+        inventory,
+        compact_inventory,
+        inventory_digest,
+    )
+
+
+# =========================================================
+# VERIFY inventory.json
+# =========================================================
+
+def bundle_verify_inventory(
+    files,
+    recomputed_inventory,
+    compact_recomputed_inventory,
+    recompute_success,
+    violations
+):
+    """
+    inventory.json must:
+
+    - be valid JSON array
+    - list every actual file except itself
+    - have exact entry keys in exact order
+    - be sorted by UTF-8 filename
+    - have recomputed bytes/SHA
+    - itself be compact JSON matching recomputed form
+    """
+
+    if "inventory.json" not in files:
+
+        return
+
+
+    raw_inventory = files[
+        "inventory.json"
+    ]
+
+
+    if not bundle_is_utf8_string(
+        raw_inventory
+    ):
+
+        return
+
+
+    try:
+
+        parsed_inventory = (
+            strict_json_loads(
+                raw_inventory
+            )
+        )
+
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+    ):
+
+        violations.append(
+            "INVALID_JSON:inventory.json"
+        )
+
+        return
+
+
+    if not isinstance(
+        parsed_inventory,
+        list
+    ):
+
+        violations.append(
+            "INVENTORY_MISMATCH"
+        )
+
+        return
+
+
+    structure_valid = True
+
+
+    seen_names = set()
+
+    previous_name_bytes = None
+
+
+    for entry in parsed_inventory:
+
+
+        if not isinstance(
+            entry,
+            dict
+        ):
+
+            structure_valid = False
+            break
+
+
+        # Exact key order is required.
+        if list(
+            entry.keys()
+        ) != [
+            "name",
+            "bytes",
+            "sha256",
+        ]:
+
+            structure_valid = False
+            break
+
+
+        name = entry.get(
+            "name"
+        )
+
+        byte_count = entry.get(
+            "bytes"
+        )
+
+        sha_value = entry.get(
+            "sha256"
+        )
+
+
+        if not bundle_is_nonempty_string(
+            name
+        ):
+
+            structure_valid = False
+            break
+
+
+        if name in seen_names:
+
+            structure_valid = False
+            break
+
+
+        seen_names.add(
+            name
+        )
+
+
+        # Bytes are exact UTF-8 length,
+        # therefore non-negative safe integer.
+        if (
+            not isinstance(
+                byte_count,
+                int
+            )
+            or isinstance(
+                byte_count,
+                bool
+            )
+            or byte_count < 0
+            or byte_count
+            > SAFE_INTEGER_MAX
+        ):
+
+            structure_valid = False
+            break
+
+
+        if (
+            not isinstance(
+                sha_value,
+                str
+            )
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                sha_value
+            )
+            is None
+        ):
+
+            structure_valid = False
+            break
+
+
+        # Verify UTF-8 sorting.
+        name_bytes = name.encode(
+            "utf-8"
+        )
+
+
+        if (
+            previous_name_bytes
+            is not None
+            and name_bytes
+            < previous_name_bytes
+        ):
+
+            structure_valid = False
+            break
+
+
+        previous_name_bytes = (
+            name_bytes
+        )
+
+
+    if not structure_valid:
+
+        violations.append(
+            "INVENTORY_MISMATCH"
+        )
+
+        return
+
+
+    # If actual bundle files could not be recomputed,
+    # the inventory cannot be trusted.
+    if not recompute_success:
+
+        violations.append(
+            "INVENTORY_MISMATCH"
+        )
+
+        return
+
+
+    # Structural and value comparison.
+    if (
+        parsed_inventory
+        != recomputed_inventory
+    ):
+
+        violations.append(
+            "INVENTORY_MISMATCH"
+        )
+
+        return
+
+
+    # The file itself must be the exact COMPACT JSON
+    # representation of the recomputed inventory.
+    if (
+        raw_inventory
+        != compact_recomputed_inventory
+    ):
+
+        violations.append(
+            "INVENTORY_MISMATCH"
+        )
+
+
+# =========================================================
+# ADAPTER CONFIG VERIFICATION
+# =========================================================
+
+def bundle_verify_adapter_config(
+    files,
+    violations
+):
+    """
+    adapter_config.json:
+
+    {
+        "r": positive safe integer,
+        "target_modules": [
+            unique non-empty strings
+        ]
+    }
+
+    Extra properties allowed.
+    """
+
+    parsed = bundle_parse_json_file(
+        "adapter_config.json",
+        files,
+        violations
+    )
+
+
+    if parsed is None:
+
+        return None
+
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        violations.append(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+        return None
+
+
+    rank = parsed.get(
+        "r"
+    )
+
+
+    targets = parsed.get(
+        "target_modules"
+    )
+
+
+    rank_valid = (
+        bundle_is_safe_positive_int(
+            rank
+        )
+    )
+
+
+    targets_valid = (
+
+        isinstance(
+            targets,
+            list
+        )
+
+        and len(
+            targets
+        ) > 0
+
+        and all(
+            bundle_is_nonempty_string(
+                target
+            )
+            for target
+            in targets
+        )
+
+        and len(
+            set(
+                targets
+            )
+        )
+        == len(
+            targets
+        )
+    )
+
+
+    if not (
+        rank_valid
+        and targets_valid
+    ):
+
+        violations.append(
+            "INVALID_ADAPTER_CONFIG"
+        )
+
+
+    return parsed
+
+
+# =========================================================
+# TRAINING MANIFEST VERIFICATION
+# =========================================================
+
+def bundle_verify_training_manifest(
+    files,
+    violations
+):
+    """
+    Required manifest fields:
+
+    baseRevision
+    task
+    datasetDigest
+    codeDigest
+    trainingConfigDigest
+    modelArtifactDigest
+    evaluationArtifactDigest
+    """
+
+    parsed = bundle_parse_json_file(
+        "training_manifest.json",
+        files,
+        violations
+    )
+
+
+    if parsed is None:
+
+        return None
+
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        violations.append(
+            "INVALID_TRAINING_MANIFEST"
+        )
+
+        return None
+
+
+    required_fields = [
+        "baseRevision",
+        "task",
+        "datasetDigest",
+        "codeDigest",
+        "trainingConfigDigest",
+        "modelArtifactDigest",
+        "evaluationArtifactDigest",
+    ]
+
+
+    # -----------------------------------------------------
+    # Missing fields
+    # -----------------------------------------------------
+
+    for field in required_fields:
+
+        if field not in parsed:
+
+            violations.append(
+                "MISSING_MANIFEST_FIELD:"
+                + field
+            )
+
+
+    # -----------------------------------------------------
+    # Base revision
+    # -----------------------------------------------------
+
+    if "baseRevision" in parsed:
+
+        base_revision = parsed[
+            "baseRevision"
+        ]
+
+
+        if (
+            not isinstance(
+                base_revision,
+                str
+            )
+            or VERIFY_BUNDLE_BASE_REVISION_RE.fullmatch(
+                base_revision
+            )
+            is None
+        ):
+
+            violations.append(
+                "MUTABLE_BASE_REVISION"
+            )
+
+
+    # -----------------------------------------------------
+    # Other fields must be non-empty strings.
+    # -----------------------------------------------------
+
+    for field in (
+        "task",
+        "datasetDigest",
+        "codeDigest",
+        "trainingConfigDigest",
+        "modelArtifactDigest",
+        "evaluationArtifactDigest",
+    ):
+
+        if field in parsed:
+
+            if not bundle_is_nonempty_string(
+                parsed[
+                    field
+                ]
+            ):
+
+                violations.append(
+                    "INVALID_TRAINING_MANIFEST"
+                )
+
+
+    return parsed
+
+
+# =========================================================
+# EVALUATION VERIFICATION
+# =========================================================
+
+def bundle_verify_evaluation(
+    files,
+    policy_valid,
+    policy,
+    actual_model_digest,
+    violations
+):
+    """
+    Expected evaluation structure includes:
+
+    modelArtifactDigest
+    aggregate
+    slices
+
+    Extra fields and non-required slices are allowed.
+    """
+
+    parsed = bundle_parse_json_file(
+        "evaluation.json",
+        files,
+        violations
+    )
+
+
+    if parsed is None:
+
+        return None
+
+
+    if not isinstance(
+        parsed,
+        dict
+    ):
+
+        violations.append(
+            "INVALID_EVALUATION"
+        )
+
+        return None
+
+
+    # -----------------------------------------------------
+    # Model artifact binding
+    # -----------------------------------------------------
+
+    if actual_model_digest is not None:
+
+        if (
+            parsed.get(
+                "modelArtifactDigest"
+            )
+            != actual_model_digest
+        ):
+
+            violations.append(
+                "EVALUATION_ARTIFACT_MISMATCH"
+            )
+
+
+    # -----------------------------------------------------
+    # Aggregate accuracy
+    # -----------------------------------------------------
+
+    aggregate = parsed.get(
+        "aggregate"
+    )
+
+
+    aggregate_valid = (
+
+        bundle_is_finite_number(
+            aggregate
+        )
+
+        and (
+            0.0
+            <= float(
+                aggregate
+            )
+            <= 1.0
+        )
+    )
+
+
+    if not aggregate_valid:
+
+        violations.append(
+            "INVALID_AGGREGATE"
+        )
+
+
+    # -----------------------------------------------------
+    # Required slices
+    # -----------------------------------------------------
+
+    slices = parsed.get(
+        "slices"
+    )
+
+
+    if not isinstance(
+        slices,
+        dict
+    ):
+
+        violations.append(
+            "INVALID_EVALUATION"
+        )
+
+
+        if policy_valid:
+
+            for slice_name in policy[
+                "requiredSlices"
+            ]:
+
+                violations.append(
+                    "MISSING_SLICE:"
+                    + slice_name
+                )
+
+
+        return parsed
+
+
+    if policy_valid:
+
+        for slice_name in policy[
+            "requiredSlices"
+        ]:
+
+
+            # Missing required slice.
+            if slice_name not in slices:
+
+                violations.append(
+                    "MISSING_SLICE:"
+                    + slice_name
+                )
+
+                continue
+
+
+            slice_value = slices[
+                slice_name
+            ]
+
+
+            # Required slice must be finite [0,1].
+            if (
+                not bundle_is_finite_number(
+                    slice_value
+                )
+                or not (
+                    0.0
+                    <= float(
+                        slice_value
+                    )
+                    <= 1.0
+                )
+            ):
+
+                violations.append(
+                    "SLICE_RANGE:"
+                    + slice_name
+                )
+
+
+    return parsed
+
+
+# =========================================================
+# MODEL CARD MARKER
+# =========================================================
+
+def bundle_verify_model_card(
+    files,
+    policy_valid,
+    policy,
+    manifest,
+    violations
+):
+    """
+    Marker format:
+
+    <!-- tds-model-card {...} -->
+
+    We find the literal marker PREFIX rather than
+    attempting to match braces.
+
+    Therefore JSON strings like:
+
+        "{still text}"
+
+    are handled correctly.
+    """
+
+    if "README.md" not in files:
+
+        return None
+
+
+    readme = files[
+        "README.md"
+    ]
+
+
+    if not bundle_is_utf8_string(
+        readme
+    ):
+
+        return None
+
+
+    prefix = (
+        "<!-- tds-model-card "
+    )
+
+
+    # -----------------------------------------------------
+    # Find every marker prefix.
+    # -----------------------------------------------------
+
+    positions = []
+
+    search_from = 0
+
+
+    while True:
+
+        position = readme.find(
+            prefix,
+            search_from
+        )
+
+
+        if position == -1:
+            break
+
+
+        positions.append(
+            position
+        )
+
+
+        search_from = (
+            position
+            + len(prefix)
+        )
+
+
+    marker_count = len(
+        positions
+    )
+
+
+    # -----------------------------------------------------
+    # NO marker
+    #
+    # Exactly two codes.
+    # -----------------------------------------------------
+
+    if marker_count == 0:
+
+        violations.append(
+            "MODEL_CARD_COUNT"
+        )
+
+        violations.append(
+            "MISSING_MODEL_CARD"
+        )
+
+        return None
+
+
+    # -----------------------------------------------------
+    # MULTIPLE markers
+    #
+    # ONLY MODEL_CARD_COUNT.
+    # -----------------------------------------------------
+
+    if marker_count > 1:
+
+        violations.append(
+            "MODEL_CARD_COUNT"
+        )
+
+        return None
+
+
+    # -----------------------------------------------------
+    # Exactly one marker prefix.
+    # -----------------------------------------------------
+
+    start = (
+        positions[0]
+        + len(prefix)
+    )
+
+
+    end = readme.find(
+        "-->",
+        start
+    )
+
+
+    # Prefix without closing delimiter.
+    if end == -1:
+
+        violations.append(
+            "INVALID_MODEL_CARD"
+        )
+
+        return None
+
+
+    # Parse EVERYTHING between prefix and -->.
+    payload = readme[
+        start:end
+    ]
+
+
+    try:
+
+        card = strict_json_loads(
+            payload
+        )
+
+
+    except (
+        json.JSONDecodeError,
+        ValueError,
+    ):
+
+        violations.append(
+            "INVALID_MODEL_CARD"
+        )
+
+        return None
+
+
+    if not isinstance(
+        card,
+        dict
+    ):
+
+        violations.append(
+            "INVALID_MODEL_CARD"
+        )
+
+        return None
+
+
+    # -----------------------------------------------------
+    # Compare model-card claims.
+    # -----------------------------------------------------
+
+    mismatch = False
+
+
+    # Machine manifest claims.
+    if isinstance(
+        manifest,
+        dict
+    ):
+
+        machine_fields = [
+            "task",
+            "baseRevision",
+            "datasetDigest",
+            "modelArtifactDigest",
+        ]
+
+
+        for field in machine_fields:
+
+            # Only compare when the machine manifest
+            # actually supplies a usable expected value.
+            if field in manifest:
+
+                if (
+                    card.get(
+                        field
+                    )
+                    != manifest.get(
+                        field
+                    )
+                ):
+
+                    mismatch = True
+
+
+    # Policy claims.
+    if policy_valid:
+
+        for field in (
+            "license",
+            "intendedUse",
+            "limitations",
+        ):
+
+            if (
+                card.get(
+                    field
+                )
+                != policy.get(
+                    field
+                )
+            ):
+
+                mismatch = True
+
+
+    if mismatch:
+
+        violations.append(
+            "MODEL_CARD_MISMATCH"
+        )
+
+
+    return card
+
+
+# =========================================================
+# MAIN ENDPOINT
+# =========================================================
+
+@app.post("/verify-bundle")
+async def verify_bundle_endpoint(
+    request: Request
+):
+
+    request_id = (
+        uuid.uuid4().hex[:8]
+    )
+
+
+    # =====================================================
+    # 1. STRICT JSON REQUEST
+    # =====================================================
+
+    try:
+
+        raw_body = await request.body()
+
+
+        audit(
+            request_id,
+            "VERIFY_BUNDLE_HTTP_REQUEST",
+            {
+                "contentType":
+                    request.headers.get(
+                        "content-type"
+                    ),
+
+                "rawBody":
+                    repr(
+                        raw_body
+                    ),
+            }
+        )
+
+
+        body_text = raw_body.decode(
+            "utf-8"
+        )
+
+
+        body = strict_json_loads(
+            body_text
+        )
+
+
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+    ) as exc:
+
+
+        audit(
+            request_id,
+            "VERIFY_BUNDLE_PARSE_FAILED",
+            {
+                "type":
+                    type(
+                        exc
+                    ).__name__,
+
+                "message":
+                    str(
+                        exc
+                    ),
+            }
+        )
+
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # =====================================================
+    # 2. EXPLICIT HTTP-400 CONDITIONS
+    # =====================================================
+    #
+    # Assignment explicitly says:
+    #
+    # - missing policy
+    # - non-object files
+    #
+    # => HTTP 400 exactly.
+    # =====================================================
+
+    if (
+        not isinstance(
+            body,
+            dict
+        )
+        or "policy"
+        not in body
+        or not isinstance(
+            body.get(
+                "files"
+            ),
+            dict
+        )
+    ):
+
+
+        audit(
+            request_id,
+            "VERIFY_BUNDLE_TOP_LEVEL_INVALID",
+            {
+                "bodyType":
+                    type(
+                        body
+                    ).__name__,
+
+                "hasPolicy":
+                    (
+                        isinstance(
+                            body,
+                            dict
+                        )
+                        and "policy"
+                        in body
+                    ),
+
+                "filesType":
+                    (
+                        type(
+                            body.get(
+                                "files"
+                            )
+                        ).__name__
+                        if isinstance(
+                            body,
+                            dict
+                        )
+                        else None
+                    ),
+            }
+        )
+
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    policy = body.get(
+        "policy"
+    )
+
+    files = body[
+        "files"
+    ]
+
+
+    violations = []
+
+
+    # =====================================================
+    # 3. POLICY
+    # =====================================================
+
+    policy_valid = (
+        bundle_validate_policy(
+            policy
+        )
+    )
+
+
+    if not policy_valid:
+
+        violations.append(
+            "INVALID_POLICY"
+        )
+
+
+    # =====================================================
+    # 4. FILE PRESENCE + BASIC FILE VALIDITY
+    # =====================================================
+
+    for filename in (
+        VERIFY_BUNDLE_REQUIRED_FILES
+    ):
+
+
+        if filename not in files:
+
+            violations.append(
+                "MISSING_FILE:"
+                + filename
+            )
+
+
+        else:
+
+            if not bundle_is_utf8_string(
+                files[
+                    filename
+                ]
+            ):
+
+                violations.append(
+                    "INVALID_FILE:"
+                    + filename
+                )
+
+
+    # Also validate extra file contents.
+    for (
+        filename,
+        content
+    ) in files.items():
+
+
+        if not bundle_is_utf8_string(
+            filename
+        ):
+
+            violations.append(
+                "INVALID_FILE:"
+                + str(filename)
+            )
+
+
+        if not bundle_is_utf8_string(
+            content
+        ):
+
+            violations.append(
+                "INVALID_FILE:"
+                + filename
+            )
+
+
+    # =====================================================
+    # 5. EXTRA FILES
+    # =====================================================
+
+    extra_files = [
+
+        filename
+
+        for filename
+        in files.keys()
+
+        if filename
+        not in VERIFY_BUNDLE_REQUIRED_SET
+    ]
+
+
+    if len(
+        extra_files
+    ) > 0:
+
+        violations.append(
+            "UNTRACKED_FILE"
+        )
+
+
+    # =====================================================
+    # 6. UNSAFE WEIGHT EXTENSIONS
+    # =====================================================
+
+    unsafe_weights = False
+
+
+    for filename in files.keys():
+
+
+        if not isinstance(
+            filename,
+            str
+        ):
+            continue
+
+
+        lowered = filename.lower()
+
+
+        if lowered.endswith(
+            VERIFY_BUNDLE_UNSAFE_EXTENSIONS
+        ):
+
+            unsafe_weights = True
+            break
+
+
+    if unsafe_weights:
+
+        violations.append(
+            "UNSAFE_WEIGHTS"
+        )
+
+
+    # =====================================================
+    # 7. RECOMPUTE INVENTORY
+    # =====================================================
+
+    (
+        inventory_recompute_success,
+        recomputed_inventory,
+        compact_recomputed_inventory,
+        inventory_digest,
+    ) = bundle_recompute_inventory(
+        files,
+        violations
+    )
+
+
+    # =====================================================
+    # 8. VERIFY inventory.json
+    # =====================================================
+
+    bundle_verify_inventory(
+        files,
+        recomputed_inventory,
+        compact_recomputed_inventory,
+        inventory_recompute_success,
+        violations
+    )
+
+
+    # =====================================================
+    # 9. ADAPTER CONFIG
+    # =====================================================
+
+    adapter_config = (
+        bundle_verify_adapter_config(
+            files,
+            violations
+        )
+    )
+
+
+    # =====================================================
+    # 10. TRAINING MANIFEST
+    # =====================================================
+
+    training_manifest = (
+        bundle_verify_training_manifest(
+            files,
+            violations
+        )
+    )
+
+
+    # =====================================================
+    # 11. ACTUAL MODEL ARTIFACT DIGEST
+    # =====================================================
+
+    actual_model_digest = None
+
+
+    if (
+        "adapter_model.safetensors"
+        in files
+
+        and bundle_is_utf8_string(
+            files[
+                "adapter_model.safetensors"
+            ]
+        )
+    ):
+
+        actual_model_digest = (
+            bundle_sha256_text(
+                files[
+                    "adapter_model.safetensors"
+                ]
+            )
+        )
+
+
+    # =====================================================
+    # 12. ACTUAL EVALUATION FILE DIGEST
+    #
+    # Hash EXACT raw evaluation.json UTF-8 bytes.
+    # =====================================================
+
+    actual_evaluation_digest = None
+
+
+    if (
+        "evaluation.json"
+        in files
+
+        and bundle_is_utf8_string(
+            files[
+                "evaluation.json"
+            ]
+        )
+    ):
+
+        actual_evaluation_digest = (
+            bundle_sha256_text(
+                files[
+                    "evaluation.json"
+                ]
+            )
+        )
+
+
+    # =====================================================
+    # 13. TRAINING MANIFEST DIGEST BINDINGS
+    # =====================================================
+
+    if isinstance(
+        training_manifest,
+        dict
+    ):
+
+
+        # ---------------------------------------------
+        # Model artifact digest
+        # ---------------------------------------------
+
+        if (
+            actual_model_digest
+            is not None
+
+            and "modelArtifactDigest"
+            in training_manifest
+
+            and bundle_is_nonempty_string(
+                training_manifest.get(
+                    "modelArtifactDigest"
+                )
+            )
+
+            and training_manifest[
+                "modelArtifactDigest"
+            ]
+            != actual_model_digest
+        ):
+
+            violations.append(
+                "MODEL_ARTIFACT_MISMATCH"
+            )
+
+
+        # ---------------------------------------------
+        # Evaluation file digest
+        # ---------------------------------------------
+
+        if (
+            actual_evaluation_digest
+            is not None
+
+            and "evaluationArtifactDigest"
+            in training_manifest
+
+            and bundle_is_nonempty_string(
+                training_manifest.get(
+                    "evaluationArtifactDigest"
+                )
+            )
+
+            and training_manifest[
+                "evaluationArtifactDigest"
+            ]
+            != actual_evaluation_digest
+        ):
+
+            violations.append(
+                "EVALUATION_DIGEST_MISMATCH"
+            )
+
+
+    # =====================================================
+    # 14. EVALUATION CONTENT
+    # =====================================================
+
+    evaluation = bundle_verify_evaluation(
+        files,
+        policy_valid,
+        policy,
+        actual_model_digest,
+        violations
+    )
+
+
+    # =====================================================
+    # 15. MODEL CARD
+    # =====================================================
+
+    model_card = bundle_verify_model_card(
+        files,
+        policy_valid,
+        policy,
+        training_manifest,
+        violations
+    )
+
+
+    # =====================================================
+    # 16. SORT + DEDUPLICATE VIOLATIONS
+    # =====================================================
+
+    violations = bundle_sort_codes(
+        violations
+    )
+
+
+    # =====================================================
+    # 17. DECISION
+    # =====================================================
+
+    decision = (
+        "admit"
+        if len(
+            violations
+        ) == 0
+        else "reject"
+    )
+
+
+    # =====================================================
+    # 18. EXACT RESPONSE
+    # =====================================================
+
+    response = {
+
+        "decision":
+            decision,
+
+        "violations":
+            violations,
+
+        "inventoryDigest":
+            inventory_digest,
+    }
+
+
+    # =====================================================
+    # 19. AUDIT
+    # =====================================================
+
+    audit(
+        request_id,
+        "VERIFY_BUNDLE_RESULT",
+        {
+            "policyValid":
+                policy_valid,
+
+            "inventoryRecomputeSuccess":
+                inventory_recompute_success,
+
+            "actualModelDigest":
+                actual_model_digest,
+
+            "actualEvaluationDigest":
+                actual_evaluation_digest,
+
+            "trainingManifestParsed":
+                isinstance(
+                    training_manifest,
+                    dict
+                ),
+
+            "evaluationParsed":
+                isinstance(
+                    evaluation,
+                    dict
+                ),
+
+            "modelCardParsed":
+                isinstance(
+                    model_card,
+                    dict
+                ),
+
+            "response":
+                response,
+        }
+    )
+
+
+    return response
