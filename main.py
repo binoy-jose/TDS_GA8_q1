@@ -3771,54 +3771,80 @@ async def bqml_endpoint(
         request_id
     )
 
-
 # =========================================================
 # WEEK 8 - Q3
-# Verifiable MLflow Model Promotion Gate
+# Promote the Right MLflow Model from Verifiable Evidence
 # Endpoint: POST /promote
 # =========================================================
 
 
 # ---------------------------------------------------------
-# IDEMPOTENT PROMOTION STATE
+# PROMOTION STATE
 # ---------------------------------------------------------
+#
+# This remembers an alias mutation.
+#
+# Example:
+# champion 1 -> promote 3
+#
+# If the same immutable evidence is replayed later,
+# version 3 is treated as the current champion.
+#
+PROMOTION_ALIAS_STATE = {}
 
-# If a request promotes version 2, an identical replay
-# should treat 2 as the already-mutated champion and RETAIN it.
-PROMOTION_REPLAY_STATE = {}
+
+# Canonical positive integer strings:
+#
+# VALID:
+# "1"
+# "2"
+# "100"
+#
+# INVALID:
+# "0"
+# "01"
+# "-1"
+# "1.0"
+#
+PROMOTE_VERSION_RE = re.compile(
+    r"^[1-9][0-9]*$"
+)
 
 
-# ---------------------------------------------------------
-# VERSION HELPERS
-# ---------------------------------------------------------
-
-BQML_CANONICAL_VERSION_RE = re.compile(r"^[1-9][0-9]*$")
-
+# =========================================================
+# BASIC HELPERS
+# =========================================================
 
 def promote_is_number(value):
     """
-    Numeric but NOT boolean.
+    True for int / float.
+
+    False for boolean because Python considers
+    True and False integers.
     """
+
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
     )
 
 
-def promote_is_finite(value):
+def promote_is_finite_number(value):
     """
-    Valid finite numeric value.
+    True only for a finite numeric value.
     """
+
     return (
         promote_is_number(value)
         and math.isfinite(float(value))
     )
 
 
-def promote_safe_nonnegative_int(value):
+def promote_is_safe_nonnegative_int(value):
     """
     Non-negative JavaScript-safe integer.
     """
+
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
@@ -3826,26 +3852,27 @@ def promote_safe_nonnegative_int(value):
     )
 
 
-def promote_canonical_version(value):
+def promote_is_canonical_version(value):
     """
-    Version must be a canonical POSITIVE safe-integer string.
+    Version must be:
 
-    Valid:
-        "1"
-        "25"
+    - a string
+    - positive
+    - canonical
+    - JavaScript-safe integer
 
-    Invalid:
-        "0"
-        "01"
-        "-1"
-        "1.0"
-        1
+    Examples:
+
+        "1"  -> valid
+        "01" -> invalid
+        "0"  -> invalid
+         14  -> invalid
     """
 
     if not isinstance(value, str):
         return False
 
-    if BQML_CANONICAL_VERSION_RE.fullmatch(value) is None:
+    if PROMOTE_VERSION_RE.fullmatch(value) is None:
         return False
 
     try:
@@ -3861,49 +3888,153 @@ def promote_canonical_version(value):
 
 def promote_sort_codes(codes):
     """
-    Sort and deduplicate gate codes by UTF-8 bytes.
+    Sort and deduplicate reason/gate codes
+    using UTF-8 bytes.
     """
+
     return sorted(
         set(codes),
-        key=lambda value: value.encode("utf-8")
+        key=lambda value:
+            value.encode("utf-8")
     )
 
 
-def promote_request_fingerprint(body):
+def promote_failed_key(
+    raw_version,
+    index
+):
     """
-    Fingerprint the exact semantic request for replay handling.
+    failedGates is a JSON object, so its keys
+    must be strings.
 
-    Dict key order does not matter.
-    Array order DOES matter because it is part of the input.
-    """
+    Normal version:
+        "5" -> "5"
 
-    canonical = json.dumps(
-        body,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":")
-    )
+    Invalid numeric version:
+        14 -> "14"
 
-    return hashlib.sha256(
-        canonical.encode("utf-8")
-    ).hexdigest()
-
-
-def promote_failed_key(raw_version, index):
-    """
-    failedGates is a JSON object, so each key must be a string.
-
-    For normal string version IDs, use the version itself.
-
-    For malformed non-string IDs, use a deterministic synthetic
-    key so the response remains deterministic and every malformed
-    occurrence is represented.
+    Null:
+        None -> "null"
     """
 
     if isinstance(raw_version, str):
         return raw_version
 
-    return f"@invalid:{index}"
+    try:
+
+        return json.dumps(
+            raw_version,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":")
+        )
+
+    except Exception:
+
+        return (
+            "@invalid:"
+            + str(index)
+        )
+
+
+# =========================================================
+# STATE / REPLAY FINGERPRINT
+# =========================================================
+
+def promote_state_fingerprint(body):
+    """
+    Build a fingerprint from immutable evidence.
+
+    IMPORTANT:
+    championVersion is NOT included because the
+    champion alias may change after promotion.
+
+    Mutable tags are NOT included because the problem
+    explicitly says tags/descriptions are not evidence.
+    """
+
+    versions_for_state = []
+
+
+    for version_object in body.get(
+        "versions",
+        []
+    ):
+
+        if isinstance(
+            version_object,
+            dict
+        ):
+
+            clean_version = {
+
+                "version":
+                    version_object.get(
+                        "version"
+                    ),
+
+                "artifactDigest":
+                    version_object.get(
+                        "artifactDigest"
+                    ),
+
+                "evaluation":
+                    version_object.get(
+                        "evaluation"
+                    ),
+            }
+
+            versions_for_state.append(
+                clean_version
+            )
+
+        else:
+
+            versions_for_state.append(
+                version_object
+            )
+
+
+    # Order of input versions should not affect
+    # the registry identity.
+    versions_for_state = sorted(
+
+        versions_for_state,
+
+        key=lambda value:
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":")
+            ).encode("utf-8")
+    )
+
+
+    state_object = {
+
+        "asOf":
+            body.get("asOf"),
+
+        "policy":
+            body.get("policy"),
+
+        "versions":
+            versions_for_state,
+    }
+
+
+    canonical = json.dumps(
+        state_object,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":")
+    )
+
+
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
 
 
 # =========================================================
@@ -3912,191 +4043,361 @@ def promote_failed_key(raw_version, index):
 
 def promote_validate_policy(policy):
     """
-    Returns:
-        (valid, normalized_policy)
+    Validate promotion policy.
 
-    Any malformed policy causes INVALID_POLICY.
+    Returns:
+
+        (True, normalized_policy)
+
+    or
+
+        (False, None)
     """
 
-    if not isinstance(policy, dict):
+
+    # Policy itself must be an object.
+    if not isinstance(
+        policy,
+        dict
+    ):
+
         return False, None
 
 
-    dataset_digest = policy.get("datasetDigest")
-    schema_digest = policy.get("schemaDigest")
-    max_age_seconds = policy.get("maxAgeSeconds")
-    accuracy_floor = policy.get("accuracyFloor")
-    required_slices = policy.get("requiredSlices")
-    max_latency_ms = policy.get("maxLatencyMs")
-    max_size_bytes = policy.get("maxSizeBytes")
-    min_improvement = policy.get("minImprovement")
+    dataset_digest = policy.get(
+        "datasetDigest"
+    )
+
+    schema_digest = policy.get(
+        "schemaDigest"
+    )
+
+    max_age_seconds = policy.get(
+        "maxAgeSeconds"
+    )
+
+    accuracy_floor = policy.get(
+        "accuracyFloor"
+    )
+
+    required_slices = policy.get(
+        "requiredSlices"
+    )
+
+    max_latency_ms = policy.get(
+        "maxLatencyMs"
+    )
+
+    max_size_bytes = policy.get(
+        "maxSizeBytes"
+    )
+
+    min_improvement = policy.get(
+        "minImprovement"
+    )
 
 
     # -----------------------------------------------------
-    # Digests must be non-empty strings.
+    # Dataset/schema digests must be non-empty strings.
     # -----------------------------------------------------
 
     if (
-        not isinstance(dataset_digest, str)
+        not isinstance(
+            dataset_digest,
+            str
+        )
         or dataset_digest == ""
-        or not isinstance(schema_digest, str)
+        or not isinstance(
+            schema_digest,
+            str
+        )
         or schema_digest == ""
     ):
+
         return False, None
 
 
     # -----------------------------------------------------
-    # Age must be non-negative safe integer.
+    # maxAgeSeconds:
+    # non-negative safe integer
     # -----------------------------------------------------
 
-    if not promote_safe_nonnegative_int(max_age_seconds):
-        return False, None
-
-
-    # -----------------------------------------------------
-    # Accuracy floor [0,1]
-    # -----------------------------------------------------
-
-    if (
-        not promote_is_finite(accuracy_floor)
-        or not (0.0 <= float(accuracy_floor) <= 1.0)
+    if not promote_is_safe_nonnegative_int(
+        max_age_seconds
     ):
+
         return False, None
 
 
     # -----------------------------------------------------
-    # Latency must be finite and non-negative.
+    # accuracyFloor:
+    # finite [0,1]
     # -----------------------------------------------------
 
     if (
-        not promote_is_finite(max_latency_ms)
+        not promote_is_finite_number(
+            accuracy_floor
+        )
+        or not (
+            0.0
+            <= float(accuracy_floor)
+            <= 1.0
+        )
+    ):
+
+        return False, None
+
+
+    # -----------------------------------------------------
+    # maxLatencyMs:
+    # finite and non-negative
+    # -----------------------------------------------------
+
+    if (
+        not promote_is_finite_number(
+            max_latency_ms
+        )
         or float(max_latency_ms) < 0.0
     ):
+
         return False, None
 
 
     # -----------------------------------------------------
-    # Size limit must be non-negative safe integer.
+    # maxSizeBytes:
+    # non-negative safe integer
     # -----------------------------------------------------
 
-    if not promote_safe_nonnegative_int(max_size_bytes):
+    if not promote_is_safe_nonnegative_int(
+        max_size_bytes
+    ):
+
         return False, None
 
 
     # -----------------------------------------------------
-    # Minimum improvement must be finite [0,1].
+    # minImprovement:
+    # finite [0,1]
     # -----------------------------------------------------
 
     if (
-        not promote_is_finite(min_improvement)
-        or not (0.0 <= float(min_improvement) <= 1.0)
+        not promote_is_finite_number(
+            min_improvement
+        )
+        or not (
+            0.0
+            <= float(min_improvement)
+            <= 1.0
+        )
     ):
+
         return False, None
 
 
     # -----------------------------------------------------
-    # Required slices
+    # requiredSlices
     # -----------------------------------------------------
 
-    if not isinstance(required_slices, dict):
+    if not isinstance(
+        required_slices,
+        dict
+    ):
+
         return False, None
 
 
-    normalized_slices = {}
+    normalized_required_slices = {}
 
 
-    for slice_name, floor in required_slices.items():
+    for (
+        slice_name,
+        slice_floor
+    ) in required_slices.items():
 
-        if (
-            not isinstance(slice_name, str)
-            or slice_name == ""
+
+        # JSON object keys are strings, but also make
+        # sure they can be encoded to UTF-8.
+        if not isinstance(
+            slice_name,
+            str
         ):
+
             return False, None
+
 
         try:
-            slice_name.encode("utf-8")
+
+            slice_name.encode(
+                "utf-8"
+            )
 
         except UnicodeEncodeError:
+
             return False, None
 
 
+        # Slice floor must be finite [0,1].
         if (
-            not promote_is_finite(floor)
-            or not (0.0 <= float(floor) <= 1.0)
+            not promote_is_finite_number(
+                slice_floor
+            )
+            or not (
+                0.0
+                <= float(slice_floor)
+                <= 1.0
+            )
         ):
+
             return False, None
 
 
-        normalized_slices[slice_name] = float(floor)
+        normalized_required_slices[
+            slice_name
+        ] = float(
+            slice_floor
+        )
 
 
-    return True, {
-        "datasetDigest": dataset_digest,
-        "schemaDigest": schema_digest,
-        "maxAgeSeconds": max_age_seconds,
-        "accuracyFloor": float(accuracy_floor),
-        "requiredSlices": normalized_slices,
-        "maxLatencyMs": float(max_latency_ms),
-        "maxSizeBytes": max_size_bytes,
-        "minImprovement": float(min_improvement),
+    # -----------------------------------------------------
+    # Normalized policy
+    # -----------------------------------------------------
+
+    normalized = {
+
+        "datasetDigest":
+            dataset_digest,
+
+        "schemaDigest":
+            schema_digest,
+
+        "maxAgeSeconds":
+            max_age_seconds,
+
+        "accuracyFloor":
+            float(
+                accuracy_floor
+            ),
+
+        "requiredSlices":
+            normalized_required_slices,
+
+        "maxLatencyMs":
+            float(
+                max_latency_ms
+            ),
+
+        "maxSizeBytes":
+            max_size_bytes,
+
+        "minImprovement":
+            float(
+                min_improvement
+            ),
     }
 
 
+    return True, normalized
+
+
 # =========================================================
-# EVALUATION GATES FOR ONE VERSION
+# NORMALIZED UTC -> DATETIME
 # =========================================================
 
-def promote_evaluate_version(
+def promote_utc_to_datetime(
+    normalized_time
+):
+    """
+    Convert our Q1 timestamp format:
+
+    2026-08-10T00:00:00.000Z
+
+    into an aware datetime.
+    """
+
+    return datetime.strptime(
+        normalized_time,
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    ).replace(
+        tzinfo=timezone.utc
+    )
+
+
+# =========================================================
+# VALIDATE ONE VERSION'S EVIDENCE
+# =========================================================
+
+def promote_evaluate_evidence(
     version_object,
     as_of_utc,
     policy_valid,
-    policy,
+    policy
 ):
     """
-    Evaluate one model version using ONLY its immutable
-    evaluation evidence.
+    Validate immutable evaluation evidence.
 
-    Tags are deliberately ignored.
+    Tags and descriptions are intentionally ignored.
     """
 
     codes = []
 
 
     # -----------------------------------------------------
-    # Missing or malformed evaluation
-    # -----------------------------------------------------
-
-    evaluation = (
-        version_object.get("evaluation")
-        if isinstance(version_object, dict)
-        else None
-    )
-
-
-    if not isinstance(evaluation, dict):
-
-        codes.append("MISSING_EVALUATION")
-
-        return promote_sort_codes(codes)
-
-
-    # -----------------------------------------------------
-    # Invalid policy applies to every version.
+    # Invalid policy
     # -----------------------------------------------------
 
     if not policy_valid:
 
-        codes.append("INVALID_POLICY")
+        codes.append(
+            "INVALID_POLICY"
+        )
 
 
     # -----------------------------------------------------
-    # createdAt
+    # Invalid asOf timestamp
     # -----------------------------------------------------
 
-    created_at_raw = evaluation.get("createdAt")
+    if as_of_utc is None:
 
-    created_at_utc = parse_event_time(
-        created_at_raw
+        codes.append(
+            "INVALID_TIMESTAMP"
+        )
+
+
+    # -----------------------------------------------------
+    # Evaluation object
+    # -----------------------------------------------------
+
+    evaluation = (
+        version_object.get(
+            "evaluation"
+        )
+    )
+
+
+    if not isinstance(
+        evaluation,
+        dict
+    ):
+
+        codes.append(
+            "MISSING_EVALUATION"
+        )
+
+        return promote_sort_codes(
+            codes
+        )
+
+
+    # =====================================================
+    # TIMESTAMP EVIDENCE
+    # =====================================================
+
+    created_at_utc = (
+        parse_event_time(
+            evaluation.get(
+                "createdAt"
+            )
+        )
     )
 
 
@@ -4107,33 +4408,31 @@ def promote_evaluate_version(
         )
 
 
-    # -----------------------------------------------------
-    # FUTURE / STALE checks
-    # -----------------------------------------------------
-
+    # Only compare age when both timestamps are valid
+    # and policy is valid.
     if (
         created_at_utc is not None
         and as_of_utc is not None
         and policy_valid
     ):
 
-        # Convert normalized UTC timestamps back to datetime.
-        created_dt = datetime.strptime(
-            created_at_utc,
-            "%Y-%m-%dT%H:%M:%S.%fZ"
-        ).replace(
-            tzinfo=timezone.utc
+        created_dt = (
+            promote_utc_to_datetime(
+                created_at_utc
+            )
         )
 
-        as_of_dt = datetime.strptime(
-            as_of_utc,
-            "%Y-%m-%dT%H:%M:%S.%fZ"
-        ).replace(
-            tzinfo=timezone.utc
+        as_of_dt = (
+            promote_utc_to_datetime(
+                as_of_utc
+            )
         )
 
 
-        # Evidence cannot come from the future.
+        # ---------------------------------------------
+        # Future evidence
+        # ---------------------------------------------
+
         if created_dt > as_of_dt:
 
             codes.append(
@@ -4141,16 +4440,23 @@ def promote_evaluate_version(
             )
 
 
+        # ---------------------------------------------
+        # Stale evidence
+        # ---------------------------------------------
+
         else:
 
             age_seconds = (
-                as_of_dt - created_dt
+                as_of_dt
+                - created_dt
             ).total_seconds()
 
 
             if (
                 age_seconds
-                > policy["maxAgeSeconds"]
+                > policy[
+                    "maxAgeSeconds"
+                ]
             ):
 
                 codes.append(
@@ -4158,9 +4464,9 @@ def promote_evaluate_version(
                 )
 
 
-    # -----------------------------------------------------
-    # Registered artifact binding
-    # -----------------------------------------------------
+    # =====================================================
+    # IMMUTABLE DIGEST BINDING
+    # =====================================================
 
     registered_artifact = (
         version_object.get(
@@ -4169,18 +4475,26 @@ def promote_evaluate_version(
     )
 
 
-    evaluation_artifact = (
+    evidence_artifact = (
         evaluation.get(
             "artifactDigest"
         )
     )
 
 
+    # Evaluation artifact must exactly bind to
+    # the registered artifact.
     if (
-        not isinstance(registered_artifact, str)
+        not isinstance(
+            registered_artifact,
+            str
+        )
         or registered_artifact == ""
-        or not isinstance(evaluation_artifact, str)
-        or evaluation_artifact
+        or not isinstance(
+            evidence_artifact,
+            str
+        )
+        or evidence_artifact
         != registered_artifact
     ):
 
@@ -4189,15 +4503,17 @@ def promote_evaluate_version(
         )
 
 
-    # -----------------------------------------------------
-    # Dataset / schema lineage
-    # -----------------------------------------------------
-
+    # Dataset/schema comparison needs a valid policy.
     if policy_valid:
 
+
         if (
-            evaluation.get("datasetDigest")
-            != policy["datasetDigest"]
+            evaluation.get(
+                "datasetDigest"
+            )
+            != policy[
+                "datasetDigest"
+            ]
         ):
 
             codes.append(
@@ -4206,8 +4522,12 @@ def promote_evaluate_version(
 
 
         if (
-            evaluation.get("schemaDigest")
-            != policy["schemaDigest"]
+            evaluation.get(
+                "schemaDigest"
+            )
+            != policy[
+                "schemaDigest"
+            ]
         ):
 
             codes.append(
@@ -4215,17 +4535,28 @@ def promote_evaluate_version(
             )
 
 
-    # -----------------------------------------------------
-    # Accuracy
-    # -----------------------------------------------------
+    # =====================================================
+    # ACCURACY
+    # =====================================================
 
     accuracy = evaluation.get(
         "accuracy"
     )
 
 
-    if not promote_is_finite(
+    # Wrong type.
+    if not promote_is_number(
         accuracy
+    ):
+
+        codes.append(
+            "METRIC_RANGE"
+        )
+
+
+    # NaN / infinity.
+    elif not math.isfinite(
+        float(accuracy)
     ):
 
         codes.append(
@@ -4240,8 +4571,11 @@ def promote_evaluate_version(
         )
 
 
+        # Accuracy must be [0,1].
         if not (
-            0.0 <= accuracy_value <= 1.0
+            0.0
+            <= accuracy_value
+            <= 1.0
         ):
 
             codes.append(
@@ -4249,10 +4583,13 @@ def promote_evaluate_version(
             )
 
 
+        # Aggregate accuracy policy floor.
         elif (
             policy_valid
             and accuracy_value
-            < policy["accuracyFloor"]
+            < policy[
+                "accuracyFloor"
+            ]
         ):
 
             codes.append(
@@ -4260,17 +4597,26 @@ def promote_evaluate_version(
             )
 
 
-    # -----------------------------------------------------
-    # Latency
-    # -----------------------------------------------------
+    # =====================================================
+    # LATENCY
+    # =====================================================
 
     latency = evaluation.get(
         "latencyMs"
     )
 
 
-    if not promote_is_finite(
+    if not promote_is_number(
         latency
+    ):
+
+        codes.append(
+            "METRIC_RANGE"
+        )
+
+
+    elif not math.isfinite(
+        float(latency)
     ):
 
         codes.append(
@@ -4285,6 +4631,7 @@ def promote_evaluate_version(
         )
 
 
+        # Latency must be non-negative.
         if latency_value < 0:
 
             codes.append(
@@ -4295,7 +4642,9 @@ def promote_evaluate_version(
         elif (
             policy_valid
             and latency_value
-            > policy["maxLatencyMs"]
+            > policy[
+                "maxLatencyMs"
+            ]
         ):
 
             codes.append(
@@ -4303,20 +4652,35 @@ def promote_evaluate_version(
             )
 
 
-    # -----------------------------------------------------
-    # Size
-    # -----------------------------------------------------
+    # =====================================================
+    # SIZE
+    # =====================================================
 
     size_bytes = evaluation.get(
         "sizeBytes"
     )
 
 
-    if not promote_safe_nonnegative_int(
+    # A numeric infinity should specifically be NON_FINITE.
+    if (
+        promote_is_number(
+            size_bytes
+        )
+        and not math.isfinite(
+            float(size_bytes)
+        )
+    ):
+
+        codes.append(
+            "NON_FINITE"
+        )
+
+
+    # Otherwise size must be a non-negative safe integer.
+    elif not promote_is_safe_nonnegative_int(
         size_bytes
     ):
 
-        # Wrong type / unsafe / negative.
         codes.append(
             "METRIC_RANGE"
         )
@@ -4325,7 +4689,9 @@ def promote_evaluate_version(
     elif (
         policy_valid
         and size_bytes
-        > policy["maxSizeBytes"]
+        > policy[
+            "maxSizeBytes"
+        ]
     ):
 
         codes.append(
@@ -4333,22 +4699,164 @@ def promote_evaluate_version(
         )
 
 
-    # -----------------------------------------------------
-    # Required slices
-    # -----------------------------------------------------
+    # =====================================================
+    # SLICE VALIDATION
+    # =====================================================
 
     slices = evaluation.get(
         "slices"
     )
 
 
-    # If slices itself is malformed, every required
-    # slice is effectively missing.
-    if not isinstance(slices, dict):
+    if isinstance(
+        slices,
+        dict
+    ):
+
+
+        # -------------------------------------------------
+        # First validate every supplied slice value.
+        # -------------------------------------------------
+
+        for (
+            slice_name,
+            slice_value
+        ) in slices.items():
+
+
+            # Non-numeric slice value.
+            #
+            # Example:
+            # "rare": "invalid"
+            if not promote_is_number(
+                slice_value
+            ):
+
+                codes.append(
+                    "SLICE_RANGE:"
+                    + slice_name
+                )
+
+                continue
+
+
+            # NaN / infinity.
+            if not math.isfinite(
+                float(slice_value)
+            ):
+
+                codes.append(
+                    "NON_FINITE"
+                )
+
+                continue
+
+
+            numeric_slice = float(
+                slice_value
+            )
+
+
+            # Finite but outside [0,1].
+            if not (
+                0.0
+                <= numeric_slice
+                <= 1.0
+            ):
+
+                codes.append(
+                    "SLICE_RANGE:"
+                    + slice_name
+                )
+
+
+        # -------------------------------------------------
+        # Now check REQUIRED slices.
+        # -------------------------------------------------
 
         if policy_valid:
 
-            for slice_name in (
+            for (
+                required_name,
+                required_floor
+            ) in policy[
+                "requiredSlices"
+            ].items():
+
+
+                # Missing required slice.
+                if (
+                    required_name
+                    not in slices
+                ):
+
+                    codes.append(
+                        "MISSING_SLICE:"
+                        + required_name
+                    )
+
+                    continue
+
+
+                required_value = (
+                    slices[
+                        required_name
+                    ]
+                )
+
+
+                # Invalid values already receive their
+                # range/non-finite code above.
+                #
+                # Do not also apply SLICE_FLOOR.
+                if (
+                    not promote_is_number(
+                        required_value
+                    )
+                    or not math.isfinite(
+                        float(required_value)
+                    )
+                ):
+
+                    continue
+
+
+                required_value = float(
+                    required_value
+                )
+
+
+                if not (
+                    0.0
+                    <= required_value
+                    <= 1.0
+                ):
+
+                    continue
+
+
+                # Inclusive floor:
+                #
+                # equal value PASSES.
+                if (
+                    required_value
+                    < required_floor
+                ):
+
+                    codes.append(
+                        "SLICE_FLOOR:"
+                        + required_name
+                    )
+
+
+    else:
+
+        # slices is missing/not an object.
+        #
+        # Every required slice is missing.
+        if policy_valid:
+
+            for required_name in (
                 policy[
                     "requiredSlices"
                 ].keys()
@@ -4356,84 +4864,7 @@ def promote_evaluate_version(
 
                 codes.append(
                     "MISSING_SLICE:"
-                    + slice_name
-                )
-
-
-    elif policy_valid:
-
-        for slice_name, floor in (
-            policy[
-                "requiredSlices"
-            ].items()
-        ):
-
-
-            # ---------------------------------------------
-            # Missing slice
-            # ---------------------------------------------
-
-            if slice_name not in slices:
-
-                codes.append(
-                    "MISSING_SLICE:"
-                    + slice_name
-                )
-
-                continue
-
-
-            slice_value = slices[
-                slice_name
-            ]
-
-
-            # ---------------------------------------------
-            # Slice must be finite [0,1]
-            # ---------------------------------------------
-
-            if not promote_is_finite(
-                slice_value
-            ):
-
-                codes.append(
-                    "NON_FINITE"
-                )
-
-                codes.append(
-                    "SLICE_RANGE:"
-                    + slice_name
-                )
-
-                continue
-
-
-            slice_value = float(
-                slice_value
-            )
-
-
-            if not (
-                0.0 <= slice_value <= 1.0
-            ):
-
-                codes.append(
-                    "SLICE_RANGE:"
-                    + slice_name
-                )
-
-                continue
-
-
-            # ---------------------------------------------
-            # Inclusive slice floor
-            # ---------------------------------------------
-
-            if slice_value < floor:
-
-                codes.append(
-                    "SLICE_FLOOR:"
-                    + slice_name
+                    + required_name
                 )
 
 
@@ -4443,7 +4874,59 @@ def promote_evaluate_version(
 
 
 # =========================================================
-# /promote ENDPOINT
+# RANKING HELPER
+# =========================================================
+
+def promote_rank_key(
+    version_id,
+    lookup
+):
+    """
+    Required ranking:
+
+    1. accuracy DESC
+    2. latency ASC
+    3. size ASC
+    4. numeric version ASC
+    """
+
+    evaluation = (
+        lookup[
+            version_id
+        ][
+            "object"
+        ][
+            "evaluation"
+        ]
+    )
+
+
+    return (
+
+        -float(
+            evaluation[
+                "accuracy"
+            ]
+        ),
+
+        float(
+            evaluation[
+                "latencyMs"
+            ]
+        ),
+
+        evaluation[
+            "sizeBytes"
+        ],
+
+        int(
+            version_id
+        ),
+    )
+
+
+# =========================================================
+# MAIN /promote ENDPOINT
 # =========================================================
 
 @app.post("/promote")
@@ -4451,18 +4934,20 @@ async def promote_endpoint(
     request: Request
 ):
 
+
     request_id = (
         uuid.uuid4().hex[:8]
     )
 
 
-    # -----------------------------------------------------
-    # 1. Strict JSON parsing
-    # -----------------------------------------------------
+    # =====================================================
+    # 1. STRICT REQUEST PARSING
+    # =====================================================
 
     try:
 
         raw_body = await request.body()
+
 
         audit(
             request_id,
@@ -4474,7 +4959,9 @@ async def promote_endpoint(
                     ),
 
                 "rawBody":
-                    repr(raw_body),
+                    repr(
+                        raw_body
+                    ),
             }
         )
 
@@ -4495,92 +4982,23 @@ async def promote_endpoint(
         ValueError,
     ) as exc:
 
+
         audit(
             request_id,
             "PROMOTE_PARSE_FAILED",
             {
                 "type":
-                    type(exc).__name__,
+                    type(
+                        exc
+                    ).__name__,
 
                 "message":
-                    str(exc),
-            }
-        )
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": "INVALID_INPUT"
-            }
-        )
-
-
-    audit(
-        request_id,
-        "PROMOTE_REQUEST_PARSED",
-        body
-    )
-
-
-    # -----------------------------------------------------
-    # 2. Top-level contract
-    #
-    # Explicit assignment rule:
-    #
-    # missing policy
-    # non-array versions
-    # non-string championVersion
-    #
-    # => HTTP 400 exactly INVALID_INPUT.
-    # -----------------------------------------------------
-
-    if (
-        not isinstance(body, dict)
-        or "policy" not in body
-        or not isinstance(
-            body.get("versions"),
-            list
-        )
-        or not isinstance(
-            body.get("championVersion"),
-            str
-        )
-    ):
-
-        audit(
-            request_id,
-            "PROMOTE_TOP_LEVEL_INVALID",
-            {
-                "bodyType":
-                    type(body).__name__,
-
-                "hasPolicy":
-                    (
-                        isinstance(body, dict)
-                        and "policy" in body
-                    ),
-
-                "versionsType":
-                    (
-                        type(
-                            body.get("versions")
-                        ).__name__
-                        if isinstance(body, dict)
-                        else None
-                    ),
-
-                "championType":
-                    (
-                        type(
-                            body.get(
-                                "championVersion"
-                            )
-                        ).__name__
-                        if isinstance(body, dict)
-                        else None
+                    str(
+                        exc
                     ),
             }
         )
+
 
         return JSONResponse(
             status_code=400,
@@ -4591,35 +5009,154 @@ async def promote_endpoint(
         )
 
 
-    supplied_champion = body[
-        "championVersion"
-    ]
+    # =====================================================
+    # AUDIT PARSED REQUEST
+    # =====================================================
 
-    versions = body["versions"]
-
-
-    # -----------------------------------------------------
-    # 3. asOf validation
-    # -----------------------------------------------------
-
-    as_of_utc = parse_event_time(
-        body.get("asOf")
+    audit(
+        request_id,
+        "PROMOTE_REQUEST_PARSED",
+        body
     )
 
 
-    # Invalid asOf is an evidence timestamp failure.
-    global_timestamp_invalid = (
-        as_of_utc is None
+    # =====================================================
+    # 2. REQUIRED TOP-LEVEL CONTRACT
+    # =====================================================
+    #
+    # Explicit assignment requirement:
+    #
+    # - missing policy
+    # - versions not array
+    # - championVersion not string
+    #
+    # => HTTP 400 exactly:
+    #
+    # {"error":"INVALID_INPUT"}
+    # =====================================================
+
+    if (
+        not isinstance(
+            body,
+            dict
+        )
+        or "policy"
+        not in body
+        or not isinstance(
+            body.get(
+                "versions"
+            ),
+            list
+        )
+        or not isinstance(
+            body.get(
+                "championVersion"
+            ),
+            str
+        )
+    ):
+
+
+        audit(
+            request_id,
+            "PROMOTE_TOP_LEVEL_INVALID",
+            {
+                "bodyType":
+                    type(
+                        body
+                    ).__name__,
+
+                "hasPolicy":
+                    (
+                        isinstance(
+                            body,
+                            dict
+                        )
+                        and "policy"
+                        in body
+                    ),
+
+                "versionsType":
+                    (
+                        type(
+                            body.get(
+                                "versions"
+                            )
+                        ).__name__
+                        if isinstance(
+                            body,
+                            dict
+                        )
+                        else None
+                    ),
+
+                "championType":
+                    (
+                        type(
+                            body.get(
+                                "championVersion"
+                            )
+                        ).__name__
+                        if isinstance(
+                            body,
+                            dict
+                        )
+                        else None
+                    ),
+            }
+        )
+
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error":
+                    "INVALID_INPUT"
+            }
+        )
+
+
+    # =====================================================
+    # INPUT VALUES
+    # =====================================================
+
+    supplied_champion = (
+        body[
+            "championVersion"
+        ]
     )
 
 
-    # -----------------------------------------------------
-    # 4. Policy validation
-    # -----------------------------------------------------
+    versions = (
+        body[
+            "versions"
+        ]
+    )
 
-    policy_valid, policy = (
-        promote_validate_policy(
-            body.get("policy")
+
+    # =====================================================
+    # 3. VALIDATE asOf
+    # =====================================================
+
+    as_of_utc = (
+        parse_event_time(
+            body.get(
+                "asOf"
+            )
+        )
+    )
+
+
+    # =====================================================
+    # 4. VALIDATE POLICY
+    # =====================================================
+
+    (
+        policy_valid,
+        policy
+    ) = promote_validate_policy(
+        body.get(
+            "policy"
         )
     )
 
@@ -4640,56 +5177,81 @@ async def promote_endpoint(
     )
 
 
-    # -----------------------------------------------------
-    # 5. Find duplicate version IDs BEFORE lookup maps
-    # -----------------------------------------------------
+    # =====================================================
+    # 5. IDENTIFY DUPLICATE VERSION STRINGS
+    # =====================================================
+    #
+    # This happens BEFORE constructing lookup maps.
+    #
+    # Example:
+    #
+    # "2"
+    # "2"
+    #
+    # BOTH occurrences are rejected.
+    # =====================================================
 
-    version_occurrence_count = {}
+    version_counts = {}
 
 
     for version_object in versions:
 
-        if (
-            isinstance(version_object, dict)
-            and isinstance(
-                version_object.get("version"),
-                str
-            )
+
+        if isinstance(
+            version_object,
+            dict
         ):
 
-            raw_version = version_object[
-                "version"
-            ]
-
-            version_occurrence_count[
-                raw_version
-            ] = (
-                version_occurrence_count.get(
-                    raw_version,
-                    0
+            raw_version = (
+                version_object.get(
+                    "version"
                 )
-                + 1
             )
+
+
+            if isinstance(
+                raw_version,
+                str
+            ):
+
+                version_counts[
+                    raw_version
+                ] = (
+                    version_counts.get(
+                        raw_version,
+                        0
+                    )
+                    + 1
+                )
 
 
     duplicate_versions = {
-        version
-        for version, count
-        in version_occurrence_count.items()
+
+        version_id
+
+        for (
+            version_id,
+            count
+        ) in version_counts.items()
+
         if count > 1
     }
 
 
-    # -----------------------------------------------------
-    # 6. Build gates WITHOUT constructing lookup maps yet
-    # -----------------------------------------------------
+    # =====================================================
+    # 6. VALIDATE EACH INPUT VERSION
+    # =====================================================
 
     occurrence_results = []
 
 
-    for index, version_object in enumerate(
+    for (
+        index,
+        version_object
+    ) in enumerate(
         versions
     ):
+
 
         codes = []
 
@@ -4710,12 +5272,12 @@ async def promote_endpoint(
             raw_version = None
 
 
-        # ---------------------------------------------
-        # Canonical version validation
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # Canonical version?
+        # -------------------------------------------------
 
         canonical = (
-            promote_canonical_version(
+            promote_is_canonical_version(
                 raw_version
             )
         )
@@ -4728,74 +5290,60 @@ async def promote_endpoint(
             )
 
 
-        # ---------------------------------------------
-        # Duplicate detection
-        #
-        # EVERY occurrence of duplicate version
-        # is rejected.
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # Duplicate version?
+        # -------------------------------------------------
 
-        if (
-            isinstance(raw_version, str)
+        duplicate = (
+
+            isinstance(
+                raw_version,
+                str
+            )
+
             and raw_version
             in duplicate_versions
-        ):
+        )
+
+
+        if duplicate:
 
             codes.append(
                 "DUPLICATE_VERSION"
             )
 
 
-        # ---------------------------------------------
-        # Invalid global policy
-        # ---------------------------------------------
+        # -------------------------------------------------
+        # CRITICAL FIX:
+        #
+        # Duplicate / noncanonical versions are rejected
+        # BEFORE evidence validation.
+        #
+        # We DO NOT inspect their evaluation, metrics,
+        # digests or slices.
+        # -------------------------------------------------
 
-        if not policy_valid:
-
-            codes.append(
-                "INVALID_POLICY"
-            )
-
-
-        # ---------------------------------------------
-        # Invalid asOf timestamp
-        # ---------------------------------------------
-
-        if global_timestamp_invalid:
-
-            codes.append(
-                "INVALID_TIMESTAMP"
-            )
+        identity_rejected = (
+            not canonical
+            or duplicate
+        )
 
 
-        # ---------------------------------------------
-        # Evidence gates are meaningful only for
-        # dictionary version records.
-        # ---------------------------------------------
+        if not identity_rejected:
 
-        if isinstance(
-            version_object,
-            dict
-        ):
 
             evidence_codes = (
-                promote_evaluate_version(
+                promote_evaluate_evidence(
                     version_object,
                     as_of_utc,
                     policy_valid,
-                    policy,
+                    policy
                 )
             )
 
+
             codes.extend(
                 evidence_codes
-            )
-
-
-        else:
-
-            codes.append(
-                "MISSING_EVALUATION"
             )
 
 
@@ -4805,6 +5353,7 @@ async def promote_endpoint(
 
 
         result = {
+
             "index":
                 index,
 
@@ -4815,11 +5364,7 @@ async def promote_endpoint(
                 canonical,
 
             "duplicate":
-                (
-                    isinstance(raw_version, str)
-                    and raw_version
-                    in duplicate_versions
-                ),
+                duplicate,
 
             "codes":
                 codes,
@@ -4848,7 +5393,7 @@ async def promote_endpoint(
                     canonical,
 
                 "duplicate":
-                    result["duplicate"],
+                    duplicate,
 
                 "codes":
                     codes,
@@ -4856,143 +5401,239 @@ async def promote_endpoint(
         )
 
 
-    # -----------------------------------------------------
-    # 7. NOW construct canonical lookup map.
-    #
-    # Duplicate and invalid versions are excluded.
-    # -----------------------------------------------------
+    # =====================================================
+    # 7. BUILD LOOKUP ONLY AFTER IDENTITY VALIDATION
+    # =====================================================
 
     lookup = {}
 
 
     for result in occurrence_results:
 
-        raw_version = result[
-            "rawVersion"
-        ]
-
 
         if (
-            result["canonical"]
-            and not result["duplicate"]
+            result[
+                "canonical"
+            ]
+            and not result[
+                "duplicate"
+            ]
         ):
 
             lookup[
-                raw_version
+                result[
+                    "rawVersion"
+                ]
             ] = result
 
 
-    # -----------------------------------------------------
-    # 8. failedGates
+    # =====================================================
+    # 8. BUILD failedGates
+    # =====================================================
     #
-    # Include EVERY input version.
+    # Include every supplied version.
     #
-    # Eligible versions therefore appear with [].
-    # -----------------------------------------------------
+    # Eligible versions therefore have:
+    #
+    # "3": []
+    # =====================================================
 
     failed_gates = {}
 
 
     for result in occurrence_results:
 
-        key = promote_failed_key(
-            result["rawVersion"],
-            result["index"]
+
+        failed_key = (
+            promote_failed_key(
+                result[
+                    "rawVersion"
+                ],
+                result[
+                    "index"
+                ]
+            )
         )
 
 
-        # If duplicates share the same textual version,
-        # merge their gate codes.
-        if key in failed_gates:
+        # Duplicate textual versions naturally map
+        # to one JSON object key.
+        #
+        # Merge and deduplicate their codes.
+        if failed_key in failed_gates:
 
-            failed_gates[key] = (
-                promote_sort_codes(
-                    failed_gates[key]
-                    + result["codes"]
-                )
+            failed_gates[
+                failed_key
+            ] = promote_sort_codes(
+
+                failed_gates[
+                    failed_key
+                ]
+
+                + result[
+                    "codes"
+                ]
             )
+
 
         else:
 
-            failed_gates[key] = (
-                result["codes"]
-            )
+            failed_gates[
+                failed_key
+            ] = result[
+                "codes"
+            ]
 
 
-    # Sort failedGates object keys deterministically.
+    # Deterministic UTF-8 key order.
     failed_gates = {
 
         key:
-            failed_gates[key]
+            failed_gates[
+                key
+            ]
 
         for key in sorted(
+
             failed_gates.keys(),
+
             key=lambda value:
-                value.encode("utf-8")
+                value.encode(
+                    "utf-8"
+                )
         )
     }
 
 
-    # -----------------------------------------------------
-    # 9. Eligible versions
-    #
-    # A version is eligible only when it has NO gate codes.
-    # -----------------------------------------------------
+    # =====================================================
+    # 9. FIND ELIGIBLE VERSIONS
+    # =====================================================
 
     eligible_versions = []
 
 
-    for version_id, result in (
-        lookup.items()
-    ):
+    for (
+        version_id,
+        result
+    ) in lookup.items():
 
-        if result["codes"] == []:
+
+        if result[
+            "codes"
+        ] == []:
 
             eligible_versions.append(
                 version_id
             )
 
 
-    # Required output ordering is deterministic.
+    # =====================================================
+    # 10. RANK ELIGIBLE VERSIONS
+    # =====================================================
     #
-    # Version strings are canonical numeric IDs.
-    # Use numeric ascending here.
+    # IMPORTANT:
+    #
+    # eligibleVersions itself must use this ranking:
+    #
+    # accuracy descending
+    # latency ascending
+    # size ascending
+    # version ascending
+    # =====================================================
+
     eligible_versions = sorted(
+
         eligible_versions,
-        key=lambda value:
-            int(value)
+
+        key=lambda version_id:
+            promote_rank_key(
+                version_id,
+                lookup
+            )
     )
 
 
-    # -----------------------------------------------------
-    # 10. Replay/idempotency
-    # -----------------------------------------------------
+    audit(
+        request_id,
+        "PROMOTE_ELIGIBLE_RANKING",
+        {
+            "eligibleVersions":
+                eligible_versions,
 
-    request_fingerprint = (
-        promote_request_fingerprint(
+            "rankDetails":
+                [
+                    {
+                        "version":
+                            version_id,
+
+                        "accuracy":
+                            lookup[
+                                version_id
+                            ][
+                                "object"
+                            ][
+                                "evaluation"
+                            ][
+                                "accuracy"
+                            ],
+
+                        "latencyMs":
+                            lookup[
+                                version_id
+                            ][
+                                "object"
+                            ][
+                                "evaluation"
+                            ][
+                                "latencyMs"
+                            ],
+
+                        "sizeBytes":
+                            lookup[
+                                version_id
+                            ][
+                                "object"
+                            ][
+                                "evaluation"
+                            ][
+                                "sizeBytes"
+                            ],
+                    }
+
+                    for version_id
+                    in eligible_versions
+                ],
+        }
+    )
+
+
+    # =====================================================
+    # 11. DETERMINE CURRENT CHAMPION / REPLAY STATE
+    # =====================================================
+
+    state_fingerprint = (
+        promote_state_fingerprint(
             body
         )
     )
 
 
-    # First call uses supplied champion.
     effective_champion = (
         supplied_champion
     )
 
 
-    # If this exact request previously promoted a version,
-    # the alias has already changed.
-    #
-    # Replaying should RETAIN that promoted version.
+    # If an earlier call with this same immutable
+    # evidence already mutated the alias, use the
+    # stored champion.
     if (
-        request_fingerprint
-        in PROMOTION_REPLAY_STATE
+        state_fingerprint
+        in PROMOTION_ALIAS_STATE
     ):
 
         effective_champion = (
-            PROMOTION_REPLAY_STATE[
-                request_fingerprint
+            PROMOTION_ALIAS_STATE[
+                state_fingerprint
             ]
         )
 
@@ -5010,9 +5651,9 @@ async def promote_endpoint(
         )
 
 
-    # -----------------------------------------------------
-    # Default output
-    # -----------------------------------------------------
+    # =====================================================
+    # 12. DEFAULT BLOCK RESPONSE VALUES
+    # =====================================================
 
     action = "block"
 
@@ -5023,18 +5664,21 @@ async def promote_endpoint(
     evidence = None
 
 
-    # -----------------------------------------------------
-    # 11. Champion evidence MUST be valid.
-    # -----------------------------------------------------
+    # =====================================================
+    # 13. CHAMPION EVIDENCE MUST BE VALID
+    # =====================================================
 
-    champion_result = lookup.get(
-        effective_champion
+    champion_result = (
+        lookup.get(
+            effective_champion
+        )
     )
 
 
     champion_valid = (
 
-        champion_result is not None
+        champion_result
+        is not None
 
         and champion_result[
             "codes"
@@ -5042,12 +5686,14 @@ async def promote_endpoint(
     )
 
 
+    # Invalid champion evidence:
+    #
+    # action = block
+    # selectedVersion = null
+    #
+    # We simply leave defaults unchanged.
     if champion_valid:
 
-
-        # -------------------------------------------------
-        # Champion evaluation data
-        # -------------------------------------------------
 
         champion_evaluation = (
             champion_result[
@@ -5065,85 +5711,19 @@ async def promote_endpoint(
         )
 
 
-        # -------------------------------------------------
-        # 12. Rank ALL eligible versions
+        # =================================================
+        # 14. BEST ELIGIBLE VERSION
+        # =================================================
         #
-        # accuracy DESC
-        # latency ASC
-        # size ASC
-        # numeric version ASC
-        # -------------------------------------------------
+        # eligibleVersions is already ranked.
+        # =================================================
 
-        ranked = sorted(
+        if len(
+            eligible_versions
+        ) == 0:
 
-            eligible_versions,
-
-            key=lambda version_id: (
-
-                -float(
-                    lookup[
-                        version_id
-                    ][
-                        "object"
-                    ][
-                        "evaluation"
-                    ][
-                        "accuracy"
-                    ]
-                ),
-
-                float(
-                    lookup[
-                        version_id
-                    ][
-                        "object"
-                    ][
-                        "evaluation"
-                    ][
-                        "latencyMs"
-                    ]
-                ),
-
-                lookup[
-                    version_id
-                ][
-                    "object"
-                ][
-                    "evaluation"
-                ][
-                    "sizeBytes"
-                ],
-
-                int(version_id),
-            )
-        )
-
-
-        # -------------------------------------------------
-        # No better candidate exists if champion ranks first
-        # or there is no other eligible version.
-        # -------------------------------------------------
-
-        challenger_version = None
-
-
-        for version_id in ranked:
-
-            if version_id != effective_champion:
-
-                challenger_version = (
-                    version_id
-                )
-
-                break
-
-
-        # -------------------------------------------------
-        # No challenger -> retain champion
-        # -------------------------------------------------
-
-        if challenger_version is None:
-
+            # This normally cannot happen if champion is
+            # valid, because champion itself is eligible.
             action = "retain"
 
             selected_version = (
@@ -5153,98 +5733,19 @@ async def promote_endpoint(
 
         else:
 
-            challenger_evaluation = (
-                lookup[
-                    challenger_version
-                ][
-                    "object"
-                ][
-                    "evaluation"
-                ]
-            )
-
-
-            challenger_accuracy = float(
-                challenger_evaluation[
-                    "accuracy"
-                ]
-            )
-
-
-            # Required 12-decimal rounding.
-            improvement = round(
-                challenger_accuracy
-                - champion_accuracy,
-                12
-            )
-
-
-            audit(
-                request_id,
-                "PROMOTE_COMPARISON",
-                {
-                    "champion":
-                        effective_champion,
-
-                    "championAccuracy":
-                        champion_accuracy,
-
-                    "challenger":
-                        challenger_version,
-
-                    "challengerAccuracy":
-                        challenger_accuracy,
-
-                    "improvement":
-                        improvement,
-
-                    "minImprovement":
-                        (
-                            policy[
-                                "minImprovement"
-                            ]
-                            if policy_valid
-                            else None
-                        ),
-                }
+            best_version = (
+                eligible_versions[0]
             )
 
 
             # ---------------------------------------------
-            # Promote only when improvement >= threshold.
+            # Champion already ranks first.
             # ---------------------------------------------
 
             if (
-                policy_valid
-                and improvement
-                >= policy[
-                    "minImprovement"
-                ]
+                best_version
+                == effective_champion
             ):
-
-                action = "promote"
-
-                selected_version = (
-                    challenger_version
-                )
-
-
-                alias_mutation = {
-                    "alias":
-                        "champion",
-
-                    "version":
-                        challenger_version,
-                }
-
-
-                # Freeze alias mutation for exact replay.
-                PROMOTION_REPLAY_STATE[
-                    request_fingerprint
-                ] = challenger_version
-
-
-            else:
 
                 action = "retain"
 
@@ -5253,81 +5754,21 @@ async def promote_endpoint(
                 )
 
 
-        # -------------------------------------------------
-        # Selected evidence
-        # -------------------------------------------------
+            # ---------------------------------------------
+            # A challenger ranks above champion.
+            # ---------------------------------------------
 
-        if selected_version is not None:
+            else:
 
-            evidence = (
-                lookup[
-                    selected_version
-                ][
-                    "object"
-                ][
-                    "evaluation"
-                ]
-            )
-
-
-    # -----------------------------------------------------
-    # 13. Replay after promotion
-    #
-    # If the exact request already promoted earlier,
-    # this execution must retain the mutated champion
-    # rather than trying to promote it again.
-    # -----------------------------------------------------
-
-    if (
-        request_fingerprint
-        in PROMOTION_REPLAY_STATE
-        and effective_champion
-        == PROMOTION_REPLAY_STATE[
-            request_fingerprint
-        ]
-    ):
-
-        # This condition also becomes true immediately
-        # on first promotion, so distinguish whether this
-        # execution itself created aliasMutation.
-        #
-        # If aliasMutation is present, it is first promotion.
-        # Otherwise it is a replay.
-        if alias_mutation is None:
-
-            replay_version = (
-                PROMOTION_REPLAY_STATE[
-                    request_fingerprint
-                ]
-            )
-
-
-            replay_result = lookup.get(
-                replay_version
-            )
-
-
-            if (
-                replay_result is not None
-                and replay_result[
-                    "codes"
-                ] == []
-            ):
-
-                action = "retain"
-
-                effective_champion = (
-                    replay_version
+                challenger_version = (
+                    best_version
                 )
 
-                selected_version = (
-                    replay_version
-                )
 
-                alias_mutation = None
-
-                evidence = (
-                    replay_result[
+                challenger_evaluation = (
+                    lookup[
+                        challenger_version
+                    ][
                         "object"
                     ][
                         "evaluation"
@@ -5335,9 +5776,142 @@ async def promote_endpoint(
                 )
 
 
-    # -----------------------------------------------------
-    # EXACT RESPONSE SHAPE
-    # -----------------------------------------------------
+                challenger_accuracy = float(
+                    challenger_evaluation[
+                        "accuracy"
+                    ]
+                )
+
+
+                # Required:
+                # round challenger - champion
+                # to 12 decimal places.
+                improvement = round(
+
+                    challenger_accuracy
+                    - champion_accuracy,
+
+                    12
+                )
+
+
+                audit(
+                    request_id,
+                    "PROMOTE_COMPARISON",
+                    {
+                        "champion":
+                            effective_champion,
+
+                        "championAccuracy":
+                            champion_accuracy,
+
+                        "challenger":
+                            challenger_version,
+
+                        "challengerAccuracy":
+                            challenger_accuracy,
+
+                        "improvement":
+                            improvement,
+
+                        "minImprovement":
+                            (
+                                policy[
+                                    "minImprovement"
+                                ]
+                                if policy_valid
+                                else None
+                            ),
+                    }
+                )
+
+
+                # -----------------------------------------
+                # Promote when inclusive threshold passes.
+                # -----------------------------------------
+
+                if (
+                    policy_valid
+
+                    and improvement
+                    >= policy[
+                        "minImprovement"
+                    ]
+                ):
+
+                    action = "promote"
+
+                    selected_version = (
+                        challenger_version
+                    )
+
+
+                    alias_mutation = {
+
+                        "alias":
+                            "champion",
+
+                        "version":
+                            challenger_version,
+                    }
+
+
+                    # Persist alias mutation.
+                    PROMOTION_ALIAS_STATE[
+                        state_fingerprint
+                    ] = challenger_version
+
+
+                # -----------------------------------------
+                # Improvement too small -> retain champion.
+                # -----------------------------------------
+
+                else:
+
+                    action = "retain"
+
+                    selected_version = (
+                        effective_champion
+                    )
+
+
+        # =================================================
+        # 15. SELECT COMPLETE EVALUATION EVIDENCE
+        # =================================================
+
+        if selected_version is not None:
+
+            selected_result = (
+                lookup.get(
+                    selected_version
+                )
+            )
+
+
+            if (
+                selected_result
+                is not None
+            ):
+
+                # IMPORTANT:
+                #
+                # Return the COMPLETE original evaluation
+                # object exactly as evidence.
+                evidence = (
+                    selected_result[
+                        "object"
+                    ][
+                        "evaluation"
+                    ]
+                )
+
+
+    # =====================================================
+    # 16. FINAL RESPONSE
+    # =====================================================
+    #
+    # Exact fields required by assignment.
+    # =====================================================
 
     response_payload = {
 
@@ -5364,6 +5938,10 @@ async def promote_endpoint(
     }
 
 
+    # =====================================================
+    # FINAL AUDIT
+    # =====================================================
+
     audit(
         request_id,
         "PROMOTE_FINAL_RESPONSE",
@@ -5372,3 +5950,5 @@ async def promote_endpoint(
 
 
     return response_payload
+
+
